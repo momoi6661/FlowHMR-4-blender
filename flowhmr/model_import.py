@@ -155,6 +155,11 @@ def _priority(relative, path, info, known_paths):
         return 2 if path.parent.name.casefold() == "neutral" else 0
     if relative == files.FLOWHMR_CONFIG:
         return 2 if path.parent / Path(files.FLOWHMR_CKPT).name in known_paths else 0
+    if relative == files.FLOWHMR_BASE_CONFIG:
+        # The optional base config shares its filename with the main config; only
+        # accept it from a flowhmr_base folder so unrelated configs are ignored.
+        return 2 if (path.parent.name.casefold() == Path(files.FLOWHMR_BASE_CKPT).parent.name.casefold()
+                     and path.parent / Path(files.FLOWHMR_BASE_CKPT).name in known_paths) else 0
     if relative == files.SAM3D_FILES[0]:
         if path.parent / "assets" / Path(files.SAM3D_FILES[2]).name in known_paths:
             return 2

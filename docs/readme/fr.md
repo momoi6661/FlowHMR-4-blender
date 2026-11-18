@@ -6,20 +6,49 @@
 
 **[Télécharger l’édition portable pour Windows](https://github.com/xiaoerofficial021-collab/FlowHMR-Windows/releases/latest/download/FlowHMR-Windows.zip)** · [Notes de version](https://github.com/xiaoerofficial021-collab/FlowHMR-Windows/releases/latest) · [Article FlowHMR](https://arxiv.org/abs/2610.03691)
 
-## Nouveautés de la v0.3.2
+## Nouveautés de la v0.3.6
 
-- **Mises à jour.** À chaque démarrage, l’application vérifie en arrière-plan si une nouvelle version est disponible et affiche son numéro et ses nouveautés. Si vous choisissez de la télécharger, elle s’installe au prochain démarrage. Vous pouvez aussi vérifier manuellement, installer un ZIP officiel ou choisir une version antérieure. L’application reste utilisable si le service de mise à jour est inaccessible. Voir les [notes de version complètes](../release-windows.md).
-- **Vidéos longues.** L’application traite le suivi réel de la personne dans la plage sélectionnée. Au-delà de 5 000 images, le traitement continue à titre expérimental. SAM adapte la taille de ses lots à la mémoire vidéo disponible et réessaie avec des lots plus petits en cas d’échec d’allocation. La vidéo reste visible pendant le défilement de la liste des personnes.
-- **Export.** Le rythme de lecture des VMD dans MMD et l’orientation de la pose de référence des FBX génériques ont été corrigés. Mixamo accepte un modèle de personnage et Maya AdvancedSkeleton peut utiliser l’utilitaire 30 FPS fourni. L’application mémorise le dossier du dernier export réussi.
+- **Reciblage personnalisé et préréglages.** Sélectionnez les os en 3D dans un panneau flottant et redimensionnable. Le guide couvre le corps puis les deux mains, avec la symétrie activée par défaut. Le reciblage tient compte de la taille et de la longueur des membres. Les personnages et les préréglages sont enregistrés et accessibles par vignettes.
+- **Export vers le personnage actuel.** Mixamo et MetaHuman n’exigent plus de choisir à nouveau un fichier modèle. L’export vers un personnage conserve le reciblage et les corrections enregistrés. Le squelette générique reste disponible pour Mixamo. Les PMX compatibles proposent IK et FK. Le choix automatique de l’os racine privilégie « センター », puis « 全ての親 ». Après le reciblage d’un FBX personnalisé, choisissez « FBX du personnage actuel » pour retrouver le squelette d’origine, avec ou sans maillage. Le FBX du personnage actuel s’exporte une personne à la fois tout en conservant sa position et son instant d’entrée dans une scène à plusieurs. Les exports GLB et VRMA restent disponibles pour les VRM.
+- **Le VMD générique reprend les corrections du personnage.** Après avoir appliqué un personnage, l’export conserve les corrections de rotation et de translation, les réglages de la racine et le mode IK/FK des pieds, avec les noms d’os MMD standard. Pour garder les proportions exactes et le contact des semelles, choisissez l’export vers le PMX actuel.
+- **Lecture ralentie plus fluide.** La fréquence d’affichage de la chronologie se règle et se mémorise. Le ralenti interpole les poses intermédiaires sans modifier la synchronisation ni le minutage de l’export.
+- **AMD Radeon RX 6000 (expérimental).** Sous Windows 11, l’application propose un environnement ROCm adapté à l’architecture du GPU. Les paquets ont été vérifiés ; la capture complète reste à tester sur une carte RX 6000.
+- **Compatibilité MCP.** Les 19 outils existants et les options d’export en arrière-plan restent compatibles. MCP peut commuter l’IK des FBX/VRM personnalisés dont les contrôleurs sont assignés et indiquer le moteur de calcul actif. L’export qui intègre les corrections du personnage se fait dans l’application de bureau.
+
+[Notes de version complètes](../release-windows.md) · [Version précédente : v0.3.5](../release-windows-v0.3.5.md)
+
+## Configuration requise et matériel compatible
+
+| Composant | Configuration et recommandations |
+| --- | --- |
+| Système | Windows 10 ou 11 en 64 bits. Windows 11 est recommandé et requis pour AMD ROCm et Intel XPU. |
+| RAM | Au moins 16 Go. 32 Go ou plus sont recommandés, en particulier avec le CPU ou un GPU intégré. Les longues vidéos peuvent en demander davantage. |
+| Mode CPU seul | Intel / AMD x64. Aucun GPU ni mémoire vidéo requis. 32 Go de mémoire vive ou plus sont recommandés. |
+| Mémoire vidéo (GPU dédiés uniquement) | Capture de mouvements vérifiée avec 6 Go de mémoire vidéo. 8 Go ou plus sont recommandés. |
+
+| Matériel | Environnement | Statut |
+| --- | --- | --- |
+| NVIDIA GeForce RTX 50 | CUDA 12.8 | Vérifié |
+| NVIDIA GeForce RTX 30 / 40 | CUDA 12.1 | Vérifié |
+| NVIDIA GeForce RTX 20 | CUDA 12.1 | Expérimental |
+| NVIDIA GeForce GTX 10 | CUDA 12.1 | Expérimental |
+| AMD Radeon RX 9000 / 7000 | [ROCm](../amd-rocm.md) | Vérifié |
+| AMD Radeon RX 6000 | [ROCm](../amd-rocm.md) | Expérimental |
+| AMD Radeon RX 5000 | [ROCm](../amd-rocm.md) | Expérimental |
+| GPU intégrés AMD Radeon (dont les 740M / 760M / 780M et certains modèles 800M) | [ROCm](../amd-rocm.md) | Expérimental (GPU du 9950X vérifié ; caméra fixe recommandée) |
+| Intel Arc A / B et certains GPU intégrés Core Ultra Arc | [Intel XPU](../windows.md) | Expérimental (le GPU encode uniquement les images pour SAM) |
+| Processeurs Intel / AMD x64 | [CPU seul](../windows.md) | Vérifié (AMD Ryzen 9 9950X) ; Intel expérimental |
+
+L’affinage des doigts avec HaMeR est indisponible en mode CPU et avec Intel XPU. L’estimation des mains intégrée à SAM reste active.
 
 ## Édition de bureau pour Windows
 
 - **Capturez les mouvements dans une seule fenêtre.** Choisissez les personnes et la plage d’images à traiter, puis visualisez côte à côte la vidéo source et le mouvement 3D. La chronologie synchronise la lecture, les déplacements et les boucles. Vous pouvez écouter le son d’origine et alterner entre l’affichage du maillage et du squelette.
 - **Prévisualisez et exportez plusieurs personnes ensemble.** Sélectionnez plusieurs personnes dans la même vidéo. L’aperçu combiné et le FBX préservent leurs positions relatives et leurs instants d’entrée dans le cadre. Rouvrez les anciennes tâches depuis l’historique à vignettes.
-- **Ajustez le résultat selon la vidéo.** Réglez le lissage des mouvements, la correction des contacts des pieds et la hauteur du sol. Activez HaMeR pour obtenir des mouvements de doigts plus détaillés. La caméra fixe est le mode par défaut ; choisissez la caméra mobile si la caméra pivote, s’incline ou roule visiblement.
+- **Ajustez le résultat selon la vidéo.** Réglez le lissage des mouvements, la correction des contacts des pieds et la hauteur du sol. Sur un environnement GPU compatible, activez HaMeR pour obtenir des mouvements de doigts plus détaillés. La caméra fixe est le mode par défaut ; choisissez la caméra mobile si la caméra pivote, s’incline ou roule visiblement.
 - **Traitez les vidéos en local.** Installez l’environnement d’inférence et les modèles dont vous avez besoin. Les modèles sont chargés au démarrage d’une génération. Une fois configurée, l’application peut fonctionner hors ligne. L’interface est disponible en 简体中文, 繁體中文, English, 日本語, 한국어, Русский et Français et mémorise votre choix.
-- **Export de mouvements.** Exportez en FBX FlowHMR, Mixamo, MetaHuman ou Maya AdvancedSkeleton, en VMD MMD, en VRM Animation (VRMA) ou en NPZ. Les FBX FlowHMR et Mixamo peuvent inclure un maillage et une pose T ou A à l’image **−1**. Voir le [guide d’export](../retarget-export.md).
-- **Personnages personnalisés.** Prévisualisez un PMX, un VRM 0.x ou 1.0, ou un FBX Mixamo ou MetaHuman avec maillage. Choisissez un personnage par personne et conservez les réglages des os. Les rigs PMX compatibles proposent IK et FK.
+- **Export de mouvements.** Exportez en FBX FlowHMR, Mixamo, MetaHuman ou Maya AdvancedSkeleton, en VMD MMD, en VRM Animation (VRMA) ou en NPZ. L’export d’un FBX personnalisé garde le squelette d’origine et les corrections enregistrées, avec ou sans maillage. Un VRM aux os associés manuellement peut aussi être exporté en GLB avec maillage et animation. Les FBX FlowHMR et Mixamo génériques peuvent inclure un maillage et une pose T ou A à l’image **−1**. Voir le [guide d’export et de reciblage](../retarget-export.md).
+- **Personnages personnalisés.** L’aperçu accepte les PMX, les VRM 0.x ou 1.0 et les FBX Mixamo ou MetaHuman avec maillage. Attribuez un personnage par personne, associez les os, choisissez les contrôleurs IK, réglez les rotations et les translations, ou chargez un préréglage existant.
 
 ## Vidéos d’exemple
 
@@ -36,15 +65,11 @@ Pour tester vous-même l’application, utilisez la [vidéo source d’exemple](
 ## Démarrage rapide
 
 1. Sous Windows 10 ou 11 en 64 bits, extrayez entièrement `FlowHMR-Windows.zip`, ouvrez le dossier `FlowHMR` extrait et lancez `FlowHMR.exe`. Le paquet de base comprend Python, l’interface de bureau et le composant d’export FBX.
-2. Installez un pilote compatible, puis ouvrez **Environnement** (运行环境) en haut à droite pour télécharger et activer l’environnement adapté à votre GPU. Pour NVIDIA, choisissez CUDA ; la version 12.8 est recommandée pour la série RTX 50. Si votre AMD Radeon RX série 9000 utilise `gfx1201`, suivez les instructions ci-dessous pour essayer ROCm.
+2. Ouvrez **Environnement** en haut à droite, puis téléchargez et activez l’environnement adapté à votre matériel d’après le tableau ci-dessus. Mettez à jour votre pilote graphique si nécessaire. Le mode CPU ne nécessite pas de pilote graphique.
 3. Dans **Modèles**, choisissez **Télécharger tous les modèles publics** (下载全部公开模型), ou téléchargez les modèles un par un. Les fichiers sont vérifiés avant d’être placés dans `models/`. SAM 3D Body et VGGT-Omega proviennent de ModelScope. Si l’affinage des doigts est inutile, vous pouvez omettre HaMeR lors du téléchargement individuel. Consultez le tableau ci-dessous pour les modèles officiels qui nécessitent une connexion.
 4. Déposez une vidéo dans l’application, sélectionnez les personnes et la plage d’images, puis lancez la génération. Vérifiez le résultat dans l’aperçu, puis exportez-le en FBX, VMD, VRMA ou NPZ depuis le menu.
 
-### AMD Radeon RX série 9000 : prise en charge expérimentale
-
-AMD et NVIDIA utilisent les mêmes fichiers `FlowHMR-Windows.zip` et `FlowHMR.exe`. Sous Windows 11 avec une Radeon RX série 9000 à architecture `gfx1201`, ouvrez **Environnement** au premier lancement, puis téléchargez et activez **ROCm 7.14.0 · gfx1201**. L’application mémorise ce choix et sélectionne automatiquement un GPU AMD compatible. L’installation des modèles se fait de la même façon.
-
-Le téléchargement et l’extraction des paquets officiels AMD ainsi que le chargement des bibliothèques ont été vérifiés. La capture de mouvement complète, y compris l’estimation du mouvement de la caméra et HaMeR, reste à valider sur une RX 9070 XT. Consultez le [guide d’installation et de validation AMD](../../docs/amd-rocm.md).
+L’application recherche les mises à jour en arrière-plan. Cliquez sur **Rechercher des mises à jour…** à côté du sélecteur de langue pour lire les notes de version, installer une mise à jour depuis un ZIP téléchargé ou choisir une version précédente. Si GitHub est inaccessible, vous pouvez continuer à utiliser la version actuelle.
 
 ### Quels modèles officiels télécharger ?
 

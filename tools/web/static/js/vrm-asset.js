@@ -1,5 +1,5 @@
 import { Box3, Group, LoadingManager } from "three";
-import { VRMLoaderPlugin, VRMNodeConstraintManager, VRMUtils } from "../vendor/three/vrm/lib/three-vrm.module.min.js";
+import { VRMLoaderPlugin, VRMNodeConstraintManager, VRMSpringBoneCollider, VRMUtils } from "../vendor/three/vrm/lib/three-vrm.module.min.js";
 import { GLTFLoader } from "../vendor/three/vrm/loaders/GLTFLoader.js";
 import { cloneSkinnedHierarchy } from "./character-skeleton.js";
 import { appError } from "./i18n.js";
@@ -35,6 +35,18 @@ function cloneConstraints(constraints, copies) {
   }
   manager.setInitState();
   return manager;
+}
+
+function cloneColliderShapes(copies) {
+  for (const [original, copy] of copies) {
+    if (!(original instanceof VRMSpringBoneCollider)) continue;
+    // Object3D.clone() calls the collider constructor without its required shape.
+    // Keep the shape and mutable local vectors independent for each actor.
+    const shape = original.shape;
+    copy.shape = new shape.constructor({
+      ...shape, offset: shape.offset.clone(), tail: shape.tail?.clone(), normal: shape.normal?.clone(),
+    });
+  }
 }
 
 export async function loadVrmCharacter(_files, file, { signal } = {}) {
@@ -110,8 +122,12 @@ export async function loadVrmCharacter(_files, file, { signal } = {}) {
       clone() {
         if (disposed) throw appError("character.vrm_invalid");
         const { root, copies, skeletons } = cloneSkinnedHierarchy(template);
+        cloneColliderShapes(copies);
         const constraintManager = cloneConstraints(constraints, copies);
         const rig = { bones: Array.from(bones, (bone) => copies.get(bone)) };
+        const targets = new Set(rig.bones);
+        root.traverse((node) => { if (node.isBone) targets.add(node); });
+        rig.manualBones = [...targets];
         if (constraintManager) rig.updateConstraints = () => constraintManager.update();
         clones.set(root, { rig, skeletons });
         return root;

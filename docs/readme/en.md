@@ -6,20 +6,49 @@
 
 **[Download the portable Windows edition](https://github.com/xiaoerofficial021-collab/FlowHMR-Windows/releases/latest/download/FlowHMR-Windows.zip)** · [Release notes](https://github.com/xiaoerofficial021-collab/FlowHMR-Windows/releases/latest) · [FlowHMR paper](https://arxiv.org/abs/2610.03691)
 
-## What's new in v0.3.2
+## What's new in v0.3.6
 
-- **App updates.** The app checks in the background each time it starts. A new version opens a notice with its version number and release notes. If you choose to download it, the app installs it on the next launch. You can also check manually, update from an official ZIP, or select a previous version. You can keep working if the update service is unreachable. See the [full release notes](../release-windows.md).
-- **Long videos.** FlowHMR uses the actual person track within the selected range. Tracks over 5,000 frames continue as an experimental feature. SAM chooses its batch size from available VRAM and retries with smaller batches if allocation fails. The video stays visible while you scroll through the person list.
-- **Export.** This version corrects VMD playback timing in MMD and the reference pose orientation of generic FBX exports. Mixamo accepts a character template, and Maya AdvancedSkeleton can use the included 30 FPS helper. The app remembers your last successful export directory.
+- **Custom retargeting and presets.** Pick bones in 3D using a floating, resizable panel. The guide continues from the body to both hands, with automatic mirroring on by default. Retargeting accounts for the target's height and limb lengths. Save character settings and reusable presets, and browse both by thumbnail.
+- **Export to the current character.** Mixamo and MetaHuman no longer ask for a template file at export. Character exports keep the saved retargeting and corrections; Mixamo can still use a generic rig. Compatible PMX rigs support IK and FK. Automatic root mapping prefers `センター` and falls back to `全ての親`. After retargeting a custom FBX, choose Current Character FBX to export its original skeleton with optional skin. Current Character FBX exports one person at a time, preserving their placement and entry time in a group scene. VRM keeps its GLB and VRMA export options.
+- **Generic VMD uses character corrections.** With a character applied, generic export keeps joint rotation and translation corrections, root adjustments, and foot IK/FK while using standard MMD bone names. Export to the current PMX for its exact proportions and sole contact.
+- **Smoother slow playback.** Choose a timeline display rate and keep it between sessions. Interpolated poses make slow playback smoother while source synchronization and export timing stay the same.
+- **AMD Radeon RX 6000 (experimental).** The Windows 11 runtime manager offers ROCm packages matched to the GPU architecture. The packages were checked; end-to-end motion capture on RX 6000 hardware is still unverified.
+- **MCP compatibility.** The 19 existing tools and background export options stay compatible. MCP can switch IK on custom FBX/VRM rigs with assigned controllers and report the active device backend. Exports that bake character corrections use the desktop app.
+
+[Full release notes](../release-windows.md) · [Previous release: v0.3.5](../release-windows-v0.3.5.md)
+
+## System requirements and supported hardware
+
+| Component | Requirements and recommendations |
+| --- | --- |
+| OS | 64-bit Windows 10 or 11; Windows 11 recommended and required for AMD ROCm and Intel XPU. |
+| RAM | At least 16 GB. 32 GB or more recommended, especially for CPU and integrated graphics. Longer videos can need more. |
+| CPU-only mode | Intel / AMD x64. No GPU or VRAM required. 32 GB or more of system RAM recommended. |
+| VRAM (dedicated GPUs only) | Motion capture verified with 6 GB of VRAM. 8 GB or more recommended. |
+
+| Device | Runtime | Status |
+| --- | --- | --- |
+| NVIDIA GeForce RTX 50 | CUDA 12.8 | Verified |
+| NVIDIA GeForce RTX 30 / 40 | CUDA 12.1 | Verified |
+| NVIDIA GeForce RTX 20 | CUDA 12.1 | Experimental |
+| NVIDIA GeForce GTX 10 | CUDA 12.1 | Experimental |
+| AMD Radeon RX 9000 / 7000 | [ROCm](../amd-rocm.md) | Verified |
+| AMD Radeon RX 6000 | [ROCm](../amd-rocm.md) | Experimental |
+| AMD Radeon RX 5000 | [ROCm](../amd-rocm.md) | Experimental |
+| AMD Radeon integrated GPUs (including 740M / 760M / 780M and some 800M models) | [ROCm](../amd-rocm.md) | Experimental (9950X iGPU verified; fixed camera recommended) |
+| Intel Arc A / B and some Core Ultra Arc integrated GPUs | [Intel XPU](../windows.md) | Experimental (GPU runs SAM image encoding only) |
+| Intel / AMD x64 processors | [CPU only](../windows.md) | Verified (AMD Ryzen 9 9950X); Intel experimental |
+
+HaMeR finger refinement is unavailable in CPU mode and on Intel XPU. SAM still runs its built-in hand estimation.
 
 ## Windows desktop edition
 
 - **Capture motion in one window.** Choose who to track and which frames to process, then view the source video and the 3D motion side by side. The timeline keeps playback, seeking and loops in sync. Play the original audio and switch between the skinned mesh and skeleton displays.
 - **Preview and export multiple people together.** Select several people in one video. The combined preview and FBX preserve their relative positions and when each person enters. Reopen previous jobs from the thumbnail history.
-- **Adjust the result to suit the footage.** Tune motion smoothing, foot contact correction and ground height. Enable HaMeR for more detailed finger motion. Fixed camera is the default; use moving camera mode when the camera clearly rotates horizontally, tilts or rolls.
+- **Adjust the result to suit the footage.** Tune motion smoothing, foot contact correction and ground height. Enable HaMeR on a compatible GPU runtime for more detailed finger motion. Fixed camera is the default; use moving camera mode when the camera clearly rotates horizontally, tilts or rolls.
 - **Run locally.** Install the inference runtime and model files as needed. Models load when generation starts. Once set up, the app can process videos offline. The interface is available in 简体中文, 繁體中文, English, 日本語, 한국어, Русский and Français. It remembers your language after you close it.
-- **Motion export.** Export FlowHMR, Mixamo, MetaHuman, or Maya AdvancedSkeleton FBX, MMD VMD, VRM Animation (VRMA), or NPZ. FlowHMR and Mixamo FBX can include a mesh and a T-pose or A-pose at frame **−1**. See the [export guide](../retarget-export.md).
-- **Custom characters.** Preview PMX, VRM 0.x or 1.0, and skinned Mixamo or MetaHuman FBX. Assign a different character to each person and save bone adjustments. Compatible PMX rigs can switch between native IK and FK.
+- **Motion export.** Export FBX for FlowHMR, Mixamo, MetaHuman or Maya AdvancedSkeleton, along with MMD VMD, VRM Animation (VRMA) and NPZ. Custom FBX export keeps the character’s original skeleton and saved motion corrections, with optional skin. A custom-mapped VRM can also export animated GLB with skin. FlowHMR and generic Mixamo FBX can include a skinned mesh or a T-pose or A-pose at frame **−1**. See the [export and retargeting guide](../retarget-export.md).
+- **Custom characters.** Preview PMX, VRM 0.x or 1.0, and skinned Mixamo or MetaHuman FBX. Assign a separate character to each person. Map joints, assign IK controllers, and adjust rotation and translation, or load and manage a saved preset.
 
 ## Example videos
 
@@ -36,15 +65,11 @@ To try the app yourself, use the repository's [sample footage](../../assets/exam
 ## Quick start
 
 1. On 64-bit Windows 10 or 11, extract the entire `FlowHMR-Windows.zip` archive, open the extracted `FlowHMR` folder and double-click `FlowHMR.exe`. The base package includes Python, the desktop interface and the FBX export component.
-2. Install a compatible GPU driver, then open **Runtime** (运行环境) in the upper-right corner to download and enable the matching runtime. For NVIDIA, choose CUDA; CUDA 12.8 is recommended for the RTX 50 series. If your AMD Radeon RX 9000 series GPU uses `gfx1201`, follow the experimental ROCm setup below.
+2. Open **Runtime** at the top right, then download and enable the environment for your device from the table above. Update your graphics driver if needed. CPU mode does not require a graphics driver.
 3. Open **Models** and choose **Download all public models** (下载全部公开模型), or download them one by one. The app verifies the files before putting them in `models/`. SAM 3D Body and VGGT-Omega come from ModelScope. If you don't need finger refinement, you can skip HaMeR when downloading individually. Use the table below for the official models that require sign-in.
 4. Drop a video into the app, select people and a frame range, then start generation. Preview the finished motion and export FBX, VMD, VRMA, or NPZ from the menu.
 
-### AMD Radeon RX 9000 series (experimental support)
-
-AMD and NVIDIA users use the same `FlowHMR-Windows.zip` and `FlowHMR.exe`. On Windows 11 with a Radeon RX 9000 series GPU that uses `gfx1201`, open **Runtime** on first launch and download and enable **ROCm 7.14.0 · gfx1201**. The app remembers your choice and automatically selects a compatible AMD GPU. Model installation works the same way.
-
-Downloading and extracting the official AMD packages and loading their libraries have been verified. The full motion capture pipeline on an RX 9070 XT, including moving-camera estimation and HaMeR, still needs testing on that hardware. See the [AMD setup and validation guide](../../docs/amd-rocm.md).
+The desktop app checks for updates in the background. Use **Check for updates…** next to the language selector to read release notes, install an update from a downloaded ZIP, or choose a previous version. The current version remains usable if GitHub is unreachable.
 
 ### Which official model packages do I need?
 

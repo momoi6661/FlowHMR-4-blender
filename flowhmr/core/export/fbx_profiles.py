@@ -272,11 +272,13 @@ def _local_translation(node, rest_rotations, rest_scales, delta):
     return _xyz(node.LclTranslation.Get()) + delta @ rest_rotations[parent_id] / rest_scales[parent_id]
 
 
-def _import_template(mgr, template_path):
+def _import_template(mgr, template_path, *, with_skin=False):
     ios = mgr.GetIOSettings()
     # The Python SDK does not export the IO path macros. Disable embedded-media
     # extraction and texture/material import; the export only needs skeletons.
-    options = ("Material", "Texture", "ExtractEmbeddedData", "Animation", "Audio", "Constraint", "Character")
+    options = ("ExtractEmbeddedData", "Animation", "Audio", "Constraint", "Character")
+    if not with_skin:
+        options += ("Material", "Texture")
     prefix = "Import|AdvOptGrp|FileFormat|Fbx|"
     importer = fbx.FbxImporter.Create(mgr, "")
     try:
@@ -482,13 +484,24 @@ def write_mixamo_animation(template_path, outname, rotations, trans, joints, par
                               + rest_pos["righttoebase"] - rest_pos["rightfoot"])
         units = _target_units(settings)
         bind_rotation = {name: rest[_id(bones[name])] for name in mappings}
+        up = basis[:, 1]
         children = {int(parent): i for i, parent in enumerate(parents)
                     if parent in _LIMB_PARENTS or (parent >= 22 and names[i] in mappings)}
         for name, (i, _, _) in mappings.items():
             # A finger tip without a matched child uses its incoming shaft.
             child = children.get(i, int(parents[i]) if i >= 22 else None)
             if child is not None:
-                align = _align_vectors(rest_pos[names[child]] - rest_pos[name], basis @ (joints[child] - joints[i]))
+                source = basis @ (joints[child] - joints[i])
+                target = rest_pos[names[child]] - rest_pos[name]
+                if i in (7, 8):
+                    # As in the viewer, align the heading while keeping the
+                    # template's shoe pitch. Ball pivots sit at different
+                    # heights on different rigs, even with flat soles.
+                    source -= np.dot(source, up) * up
+                    target -= np.dot(target, up) * up
+                    if min(np.linalg.norm(source), np.linalg.norm(target)) < 1e-7:
+                        continue
+                align = _align_vectors(target, source)
                 bind_rotation[name] = align @ bind_rotation[name]
         for wrist, middle, index, pinky in _PALMS:
             hand, mid, fore, little = (names[i] for i in (wrist, middle, index, pinky))

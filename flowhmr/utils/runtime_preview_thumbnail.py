@@ -8,7 +8,7 @@ from threading import Lock
 _decode_lock = Lock()
 
 
-def ensure_thumbnail(video, thumbnail):
+def ensure_thumbnail(video, thumbnail, *, time_seconds=None):
     import cv2
 
     path = Path(thumbnail)
@@ -22,7 +22,9 @@ def ensure_thumbnail(video, thumbnail):
             if not capture.isOpened():
                 return False
             count = capture.get(cv2.CAP_PROP_FRAME_COUNT)
-            if math.isfinite(count) and count > 4:
+            if time_seconds is not None and math.isfinite(time_seconds) and time_seconds >= 0:
+                capture.set(cv2.CAP_PROP_POS_MSEC, time_seconds * 1000)
+            elif math.isfinite(count) and count > 4:
                 capture.set(cv2.CAP_PROP_POS_FRAMES, min(int(count * 0.18), 90))
             ok, frame = capture.read()
             if not ok:

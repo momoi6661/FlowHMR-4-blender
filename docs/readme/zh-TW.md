@@ -6,11 +6,40 @@
 
 **[下載 Windows 可攜版](https://github.com/xiaoerofficial021-collab/FlowHMR-Windows/releases/latest/download/FlowHMR-Windows.zip)** · [查看發行說明](https://github.com/xiaoerofficial021-collab/FlowHMR-Windows/releases/latest) · [FlowHMR 論文](https://arxiv.org/abs/2610.03691)
 
-## v0.3.2 更新
+## v0.3.6 更新
 
-- **程式更新。** 每次啟動時在背景檢查。有新版時會顯示版本號和更新內容，確認下載後會在下次啟動時安裝。也可手動檢查、從官方 ZIP 更新或選擇歷史版本。更新服務連不上時仍可使用軟體。見[完整發行說明](../release-windows.md)。
-- **長影片。** 依所選範圍內的實際人物軌跡處理，超過 5000 幀會繼續生成，並標示為實驗功能。SAM 依可用顯示記憶體自動選擇批次，配置失敗時縮小批次後重試。捲動選人清單時仍可看到影片預覽。
-- **匯出。** 修正 MMD 的 VMD 播放節奏，以及通用 FBX 的參考姿勢朝向。Mixamo 可選角色範本，Maya AdvancedSkeleton 可使用隨附的 30 FPS 影格率助手。軟體會記住上次成功匯出的目錄。
+- **自訂重定向與預設。** 在可拖曳、可縮放的浮動面板裡選取 3D 骨骼。指引從身體延伸到雙手，預設開啟自動鏡射；重定向會依目標角色的身高與四肢長度調整。角色與預設可儲存，並以縮圖瀏覽。
+- **依目前角色匯出。** Mixamo 和 MetaHuman 匯出時不必再選範本檔案。依角色匯出會保留已儲存的重定向與校正；Mixamo 仍可選通用骨架。相容的 PMX 支援 IK / FK，自動重心優先選用「センター」，找不到合適的骨骼時改用「全ての親」。一般自訂 FBX 套用重定向後，可選「目前角色 FBX」，依原骨架匯出並選擇是否包含蒙皮。目前角色 FBX 每次匯出一人，保留多人場景中的站位與入場時間。VRM 保留 GLB 與 VRMA 匯出。
+- **通用 VMD 保留角色校正。** 套用角色後，通用骨架會保留關節旋轉、位移、根骨調整與腳部 IK／FK，仍使用標準 MMD 骨名。要保留角色的精確比例與鞋底接地，請依目前的 PMX 角色匯出。
+- **慢動作播放更流暢。** 可設定並記住時間軸的顯示影格率，慢速播放時補算中間姿勢，原始影片的同步及匯出時間維持不變。
+- **AMD Radeon RX 6000（實驗中）。** Windows 11 的執行環境可依顯示卡架構配對 ROCm。安裝套件已核對，完整動作擷取仍待實體顯示卡驗證。
+- **MCP 相容性。** 原有 19 項工具與背景匯出參數保持相容。可為已綁定控制骨的自訂 FBX／VRM 切換 IK，也能查詢實際使用的裝置後端。烘焙目前角色校正的匯出在桌面完成。
+
+[完整更新說明](../release-windows.md) · [上一版 v0.3.5](../release-windows-v0.3.5.md)
+
+## 最低配置與支援裝置
+
+| 項目 | 基準配置 | 建議配置 |
+| --- | --- | --- |
+| 系統 | 64 位元 Windows 10 / 11 | 64 位元 Windows 11（ROCm 與 Intel XPU 需要） |
+| 系統記憶體 | 最少 16 GB | 32 GB 以上，純 CPU 或內顯尤其建議；長片可能需要更多 |
+| 純 CPU 模式 | Intel / AMD x64，無需顯示卡或顯示記憶體 | 32 GB 以上系統記憶體 |
+| 顯示記憶體（僅獨立顯示卡） | 6 GB 已實測可執行 | 8 GB 以上 |
+
+| 裝置 | 執行環境 | 驗證狀態 |
+| --- | --- | --- |
+| NVIDIA GeForce RTX 50 | CUDA 12.8 | 已驗證 |
+| NVIDIA GeForce RTX 30 / 40 | CUDA 12.1 | 已驗證 |
+| NVIDIA GeForce RTX 20 | CUDA 12.1 | 實驗中 |
+| NVIDIA GeForce GTX 10 | CUDA 12.1 | 實驗中 |
+| AMD Radeon RX 9000 / 7000 | [ROCm](../amd-rocm.md) | 已驗證 |
+| AMD Radeon RX 6000 | [ROCm](../amd-rocm.md) | 實驗中 |
+| AMD Radeon RX 5000 | [ROCm](../amd-rocm.md) | 實驗中 |
+| AMD Radeon 內顯（含 740M / 760M / 780M 與部分 800M） | [ROCm](../amd-rocm.md) | 實驗中（9950X 內顯已驗證；建議固定機位） |
+| Intel Arc A / B 與部分 Core Ultra Arc 內顯 | [Intel XPU](../windows.md) | 實驗中（GPU 僅負責 SAM 影像編碼） |
+| Intel / AMD x64 處理器 | [純 CPU](../windows.md) | 已驗證（AMD Ryzen 9 9950X）；Intel 實驗中 |
+
+純 CPU 和 Intel XPU 暫不支援 HaMeR 手指精修，SAM 內建的手部估計仍會執行。
 
 ## Windows 桌面版
 
@@ -18,8 +47,8 @@
 - **同時預覽和匯出多位人物。** 同一段影片可選取多位人物；合併預覽和 FBX 保留他們在原始影片中的相對站位和入場時間。舊任務可從附縮圖的歷程中重新開啟。
 - **依素材調整動作。** 可調整動作濾波、腳部接觸修正和地面高度。需要更細緻的手指動作時，可啟用 HaMeR 手指精修。預設使用固定機位，鏡頭明顯轉向、俯仰或翻滾時再用運動相機。
 - **在本機執行。** 依需要安裝推論環境和模型，開始生成時才載入模型。安裝完成後可離線處理。支援简体中文、繁體中文、English、日本語、한국어、Русский 和 Français，重新開啟時會記住上次選的語言。
-- **動作匯出。** 支援 FlowHMR、Mixamo、MetaHuman、Maya AdvancedSkeleton FBX，以及 MMD VMD、VRM Animation（VRMA）和 NPZ。FlowHMR 和 Mixamo FBX 可選蒙皮，以及第 **−1 幀**的 T Pose / A Pose。見[匯出與重定向](../retarget-export.md)。
-- **自訂角色。** 支援 PMX、VRM 0.x / 1.0 和含蒙皮的 Mixamo / MetaHuman FBX。多人可各自選角，並記住骨骼調整。相容的 PMX 可切換原生 IK / FK，依角色匯出的 VMD 可保留腳部 IK。
+- **動作匯出。** 支援 FlowHMR、Mixamo、MetaHuman、Maya AdvancedSkeleton FBX、MMD VMD、VRM Animation（VRMA）和 NPZ。一般自訂 FBX 可依角色原骨架與已儲存的動作校正匯出，可選擇是否包含蒙皮。套用自訂骨骼對應的 VRM 仍可匯出附蒙皮的動畫 GLB。FlowHMR 和通用 Mixamo FBX 可選擇是否包含蒙皮，以及在第 **−1 影格**加入 T Pose／A Pose。[匯出與重定向](../retarget-export.md)
+- **自訂角色。** 支援 PMX、VRM 0.x／1.0 和附蒙皮的 Mixamo／MetaHuman FBX。可為每位人物分配不同角色，對應骨骼、指定 IK 控制骨、調整旋轉與平移，也可載入與管理已儲存的預設。
 
 ## 範例影片
 
@@ -36,15 +65,11 @@
 ## 快速開始
 
 1. 在 64 位元 Windows 10 或 11 完整解壓縮 `FlowHMR-Windows.zip`，進入解壓縮後的 `FlowHMR` 資料夾，按兩下 `FlowHMR.exe`。基礎套件內含 Python、介面元件和 FBX 匯出元件。
-2. 安裝相容的顯示卡驅動程式，再從右上角 **執行環境** 下載並啟用對應版本。NVIDIA 使用者請選 CUDA，RTX 50 系列建議使用 CUDA 12.8。AMD Radeon RX 9000 系列中採用 `gfx1201` 的型號，可依下方步驟試用 ROCm。
+2. 開啟右上角的 **執行環境**，依上表下載並啟用適用於裝置的環境。使用 GPU 前，請安裝相容的顯示卡驅動程式；選擇 **CPU** 不需另裝顯示卡驅動程式。
 3. 開啟 **模型**，選擇 **下載所有公開模型**（下载全部公开模型），或逐項下載。公開模型經驗證後會放入 `models/`，其中 SAM 3D Body 和 VGGT-Omega 由 ModelScope 提供。不需要手指精修時可以略過 HaMeR。需登入下載的官方模型請依下表取得。
 4. 將影片拖入軟體，選取要處理的人物和影格範圍，再開始生成。完成後先預覽，再從選單匯出 FBX、VMD、VRMA 或 NPZ。
 
-### AMD Radeon RX 9000 系列（實驗支援）
-
-AMD 和 NVIDIA 使用同一個 `FlowHMR-Windows.zip` 和 `FlowHMR.exe`。在 Windows 11 上使用 Radeon RX 9000 系列的 `gfx1201` 型號時，首次開啟軟體後，請在 **執行環境** 下載並啟用 **ROCm 7.14.0 · gfx1201**。軟體會記住這項選擇，並自動選用相容的 AMD 顯示卡。模型安裝步驟相同。
-
-已驗證 AMD 官方套件的下載、解壓縮及程式庫載入。RX 9070 XT 上的完整動作擷取流程，包括移動相機與 HaMeR，仍待實機驗證。請參閱 [AMD 安裝與驗證說明](../../docs/amd-rocm.md)。
+程式會在背景檢查更新。語言選單旁的 **檢查更新** 可查看發行說明、手動匯入更新壓縮檔，或選擇歷史版本。無法連上 GitHub 時仍可使用目前版本。
 
 ### 該下載哪個官方模型？
 

@@ -1,0 +1,128 @@
+name: PR size limit
+
+# pull_request_target uses the workflow file from the base branch (main), so a PR
+# cannot edit this check away. We never check out PR code here, only read metadata
+# and write labels/comments, which keeps the write token safe.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, labeled, unlabeled, edited]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: pr-size-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-size:
+    name: PR size limit (3500 changed lines)
+    runs-on: ubuntu-latest
+    steps:
+      # Labels must exist before they can be applied. Create them on first run so
+      # the check works even when the labels were never added by hand.
+      - name: Ensure size and override labels exist
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const labels = [
+              { name: 'oversize', color: 'B60205', description: 'PR exceeds 3500 changed lines' },
+              { name: 'OVERRIDE', color: 'FBCA04', description: 'Skip the PR size limit' },
+            ];
+            for (const label of labels) {
+              try {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ...label,
+                });
+              } catch (error) {
+                if (error.status === 422) {
+                  // Label already exists: keep its description in sync with the limit.
+                  try {
+                    await github.rest.issues.updateLabel({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      ...label,
+                    });
+                  } catch (updateError) {
+                    core.warning(`Could not update label ${label.name}: ${updateError.message}`);
+                  }
+                } else {
+                  core.warning(`Could not create label ${label.name}: ${error.message}`);
+                }
+              }
+            }
+
+      - name: Read PR size and OVERRIDE label
+        id: guard
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const labels = (pr.labels || []).map((label) => label.name.toLowerCase());
+            const size = (pr.additions || 0) + (pr.deletions || 0);
+            const override = labels.includes('override');
+            core.setOutput('size', String(size));
+            core.setOutput('large', size > 3500 ? 'true' : 'false');
+            core.setOutput('override', override ? 'true' : 'false');
+            core.info(`PR #${pr.number}: ${size} changed lines (additions + deletions), OVERRIDE=${override}`);
+
+      # Only run the labeler for oversized PRs, so small PRs get no size label at
+      # all. All thresholds are 3500, which makes the labeler classify this run as XL.
+      - name: Label oversized PR and fail the check
+        if: steps.guard.outputs.large == 'true' && steps.guard.outputs.override != 'true'
+        uses: codelytv/pr-size-labeler@v1
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          xs_label: size/xs
+          xs_max_size: '3500'
+          s_label: size/s
+          s_max_size: '3500'
+          m_label: size/m
+          m_max_size: '3500'
+          l_label: size/l
+          l_max_size: '3500'
+          xl_label: oversize
+          fail_if_xl: 'true'
+          message_if_xl: |
+            PR超出长度限制，请确保一个PR只解决一个问题。
+            PR exceeds the 3500-line limit. Please make sure one PR addresses only one issue.
+
+      - name: Show bilingual size-limit error
+        if: failure()
+        run: |
+          echo "::error title=PR size limit / PR 长度限制::PR超出长度限制，请确保一个PR只解决一个问题。 / PR exceeds the 3500-line limit. Please make sure one PR addresses only one issue."
+
+      # OVERRIDE lets maintainers accept an oversized PR: keep the size label for
+      # visibility, but skip the labeler step above so the check passes.
+      - name: Keep size label when OVERRIDE is present
+        if: steps.guard.outputs.large == 'true' && steps.guard.outputs.override == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              labels: ['oversize'],
+            });
+
+      # A PR that shrinks below the limit should lose the stale oversize label.
+      - name: Remove stale size label for small PRs
+        if: steps.guard.outputs.large != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                name: 'oversize',
+              });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }

@@ -1,4 +1,5 @@
 import { Euler, Quaternion, Vector3 } from "three";
+import { normalizeBoneOffsets, normalizeRetargetProfile } from "./retarget-profile.js";
 
 export const ROTATION_LIMIT = 180;
 export const TRANSLATION_LIMIT = 5;
@@ -27,6 +28,10 @@ export function normalizePoseOffsets(settings) {
     rootTranslation: triple(settings?.rootTranslation, TRANSLATION_LIMIT) };
   if (settings?.pmxBaselineVersion === PMX_BASELINE_VERSION) pose.pmxBaselineVersion = PMX_BASELINE_VERSION;
   if (settings?.vrmBaselineVersion === VRM_BASELINE_VERSION) pose.vrmBaselineVersion = VRM_BASELINE_VERSION;
+  const profile = normalizeRetargetProfile(settings?.retarget);
+  if (profile) pose.retarget = profile;
+  const boneOffsets = normalizeBoneOffsets(settings?.boneOffsets);
+  if (Object.keys(boneOffsets.rotations).length || Object.keys(boneOffsets.translations).length) pose.boneOffsets = boneOffsets;
   return pose;
 }
 
@@ -70,6 +75,23 @@ export function readStoredPose(key) {
 }
 
 export const storedPose = (offsets) => JSON.stringify({ ...offsets, version: OFFSET_VERSION });
+
+// Convert the older shared finger and body corrections to individual joints
+// in the solver's original order, with the built-in calibration factored out.
+export function flattenJointCorrections(legacy, neutral, offsets) {
+  const { rotations, translations } = normalizeBoneOffsets(offsets);
+  const euler = new Euler(), rotation = new Quaternion();
+  for (const [joint, value] of legacy) {
+    rotation.copy(neutral.get(joint) ?? new Quaternion()).invert().multiply(value);
+    const extra = rotations[joint];
+    if (extra) rotation.multiply(new Quaternion().setFromEuler(euler.set(...extra.map((v) => v * DEG))));
+    euler.setFromQuaternion(rotation.normalize());
+    const angles = [euler.x, euler.y, euler.z].map((v) => Number((v / DEG).toFixed(6)));
+    if (nonzero(angles)) rotations[joint] = angles;
+    else delete rotations[joint];
+  }
+  return { rotations, translations };
+}
 
 /** Reflect rotation offsets through the character's left/right plane in bind axes. */
 export function makePoseOffsets(bindForJoint, lateral, { headPitch = HEAD_X_BASE } = {}) {

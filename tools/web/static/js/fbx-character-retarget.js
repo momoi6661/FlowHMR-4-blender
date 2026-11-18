@@ -1,5 +1,8 @@
 import { Matrix4, Quaternion, Vector3 } from "three";
-import { makePoseOffsets, normalizePoseOffsets, normalizeVrmPoseOffsets } from "./pose-offsets.js";
+import { flattenJointCorrections, makePoseOffsets, normalizePoseOffsets, normalizeVrmPoseOffsets } from "./pose-offsets.js";
+import { assertRetargetProfile, CHAINS, customJointEdits, measureProportions, normalizeRetargetProfile, targetSkeleton } from "./retarget-profile.js";
+import { suggestBodyAliases } from "./retarget-hand-names.js";
+import { appError } from "./i18n.js";
 
 const JOINTS = 52;
 const UP = new Vector3(0, 1, 0);
@@ -31,7 +34,7 @@ function layout(bones, profile) {
   const find = (...names) => {
     for (const name of names) {
       const i = byName.get(name);
-      if (i === -2) throw new Error(`Ambiguous ${profile} body bone: ${name}`);
+      if (i === -2) throw appError("retarget.mapping_required", {}, `Ambiguous ${profile} body bone: ${name}`);
       if (i != null) return i;
     }
     return -1;
@@ -72,7 +75,7 @@ function layout(bones, profile) {
           : find(...names.map((n) => `${side}hand${n}${part}`));
     }
   }
-  if (BODY.some((j) => map[j] < 0)) throw new Error(`The character is missing required ${profile} body bones.`);
+  if (BODY.some((j) => map[j] < 0)) throw appError("retarget.mapping_required", {}, `Missing required ${profile} body bones.`);
   const descendant = (child, parent) => {
     for (let node = bones[child]?.parent; node; node = node.parent) if (node === bones[parent]) return true;
     return false;
@@ -80,7 +83,7 @@ function layout(bones, profile) {
   const verify = (indices) => {
     const present = indices.filter((i) => i >= 0);
     for (let i = 1; i < present.length; i++) if (!descendant(present[i], present[i - 1])) {
-      throw new Error(`Unexpected ${profile} body hierarchy: ${bones[present[i]].name}`);
+      throw appError("retarget.mapping_required", {}, `Unexpected ${profile} body hierarchy: ${bones[present[i]].name}`);
     }
   };
   verify([map[0], ...spine, ...neck, map[15]]);
@@ -93,6 +96,17 @@ function layout(bones, profile) {
     }
   }
   return { map, spine, neck };
+}
+
+export function suggestedFbxMap(root, asset, skeleton) {
+  const rig = asset.getRig(root);
+  const targets = rig.manualBones ?? rig.bones;
+  const indices = new Map(targets.map((bone, i) => [bone, i]));
+  if (asset.profile !== "custom") {
+    try { return Array.from(layout(rig.bones, asset.profile).map, (i) => indices.get(rig.bones[i]) ?? -1); }
+    catch { /* continue with isolated name matches */ }
+  }
+  return suggestBodyAliases(skeleton??targetSkeleton(asset,root),Array(JOINTS).fill(-1),"fbx");
 }
 
 function heading(left, right) {
@@ -183,6 +197,43 @@ function hierarchy(root) {
 const component = (attr, index, i) => i === 0 ? attr.getX(index) : i === 1 ? attr.getY(index)
   : i === 2 ? attr.getZ(index) : attr.getW(index);
 
+const soleCache = new WeakMap();
+const librarySoles = new Map();
+
+function cacheLibrarySoles(id, samples) {
+  if (!/^[a-f0-9]{64}(?:\/[0-9,-]+)?$/.test(id) || !samples) return;
+  // A library ID hashes the model and its resources. Keep only the small
+  // numeric probe data; switching characters still frees meshes and textures.
+  librarySoles.delete(id);
+  if (librarySoles.size >= 24) librarySoles.delete(librarySoles.keys().next().value);
+  librarySoles.set(id, samples);
+}
+
+function cachedSoleProbes(asset, root, primary, records, legs, order, id, signature) {
+  // Each clone has its own mutable solver records. Reuse the sampled mesh
+  // points, with their influences mapped to that clone's traversal order.
+  const local = soleCache.get(asset);
+  const cached = local?.signature === signature ? local : librarySoles.get(id);
+  if (cached?.signature === signature && cached.orderLength === order.length) {
+    soleCache.set(asset, cached);
+    cacheLibrarySoles(id, cached);
+    return cached.sides.map((parts) => parts.map((probes) => probes.map(({ y, influences }) => ({
+      y, influences: influences.map(({ index, local, weight }) => ({ record: order[index], local, weight })),
+    }))));
+  }
+  const sides = soleProbes(root, primary, records, legs, asset.rest?.bounds);
+  const indices = new Map(order.map((record, index) => [record, index]));
+  soleCache.set(asset, {
+    signature,
+    orderLength: order.length,
+    sides: sides.map((parts) => parts.map((probes) => probes.map(({ y, influences }) => ({
+      y, influences: influences.map(({ record, local, weight }) => ({ index: indices.get(record), local, weight })),
+    })))),
+  });
+  cacheLibrarySoles(id, soleCache.get(asset));
+  return sides;
+}
+
 function soleProbes(root, primary, records, legs, bounds) {
   const candidates = [[], []];
   const up = new Vector3(), point = new Vector3();
@@ -261,35 +312,51 @@ function soleProbes(root, primary, records, legs, bounds) {
  * Drive an independent, normalized character clone from a saved SMPL-H motion.
  * The file's own skin weights, bone proportions, and bind offsets remain in use.
  */
-export function createFbxCharacterRetarget(root, asset, motion, { poseOffsets = null } = {}) {
+export function createFbxCharacterRetarget(root, asset, motion, { poseOffsets = null, libraryId = null } = {}) {
   const profile = asset?.profile;
-  if (!["mixamo", "metahuman", "vrm"].includes(profile)) throw new Error("Unknown character skeleton.");
+  const manual = normalizeRetargetProfile(poseOffsets?.retarget);
+  if (!["mixamo", "metahuman", "vrm"].includes(profile) && !manual) throw appError("retarget.mapping_required");
   const { frames, joints, quaternions, contacts, floor, restFloor } = motion;
   if (!Number.isSafeInteger(frames) || frames < 1 || motion.rest?.length !== JOINTS * 3 ||
       joints?.length !== frames * JOINTS * 3 || quaternions?.length !== frames * JOINTS * 4) {
     throw new Error("Invalid saved motion for the character.");
   }
-  const primary = asset.getRig(root);
+  const original = asset.getRig(root);
+  const primary = manual ? { ...original, bones: original.manualBones ?? original.bones } : original;
   if (!primary?.bones?.length) throw new Error("The character has no body skeleton.");
-  const { map, spine, neck } = layout(primary.bones, profile);
+  if (manual) assertRetargetProfile(manual, targetSkeleton(asset, root), asset.kind);
+  const { map, spine, neck } = manual ? { map: manual.map, spine: [3,6,9].map((j) => manual.map[j]).filter((i) => i >= 0),
+    neck: manual.map[12] < 0 ? [] : [manual.map[12]] } : layout(primary.bones, profile);
+  const soleSignature = manual ? map.join(",") + "," + manual.root : "";
+  const soleId = (id) => id && (manual ? id + "/" + soleSignature : id);
   const { include, records, order, base } = hierarchy(root);
   const primaryRecords = primary.bones.map((bone) => include(bone));
   const source = Array.from({ length: JOINTS }, (_, i) => new Vector3().fromArray(motion.rest, i * 3));
   if (!source.every(finiteVector)) throw new Error("Invalid source rest position.");
   const slot = (j) => primaryRecords[map[j]];
-  const shoulders = [slot(13) ?? slot(16), slot(14) ?? slot(17)];
+  const shoulders = manual && !(slot(13) && slot(14)) ? [slot(16),slot(17)] :
+    [slot(13) ?? slot(16), slot(14) ?? slot(17)];
   const align = new Quaternion().setFromAxisAngle(UP,
     heading(source[13], source[14]) - heading(shoulders[0].bindPosition, shoulders[1].bindPosition));
   const bindForJoint = (j) => slot(j) && align.clone().multiply(slot(j).bindRotation);
-  const calibratedVrm = profile === "vrm" && Number.isFinite(motion.vrmNeckPitch);
+  const calibratedVrm = !manual && profile === "vrm" && Number.isFinite(motion.vrmNeckPitch);
   const neckBind = calibratedVrm && bindForJoint(12);
   const neckBaseline = neckBind ? neckBind.clone().invert()
     .multiply(new Quaternion().setFromAxisAngle(new Vector3(1, 0, 0), motion.vrmNeckPitch * Math.PI / 180))
     .multiply(neckBind).normalize() : null;
   const poseSettings = (settings) => calibratedVrm ? normalizeVrmPoseOffsets(settings, neckBaseline) : normalizePoseOffsets(settings);
   const edits = makePoseOffsets(bindForJoint, source[16].clone().sub(source[17]).setY(0),
-    calibratedVrm ? { headPitch: 0 } : undefined);
-  edits.set(poseSettings(poseOffsets));
+    calibratedVrm || manual ? { headPitch: 0 } : undefined);
+  const initialPose = poseSettings(poseOffsets);
+  edits.set(initialPose);
+  function editableCorrections(settings) {
+    if (manual && primary.additionalRigs?.length) return null;
+    if (!Object.keys(settings.rotations).length) return settings.retarget ?? settings.boneOffsets;
+    const neutral = makePoseOffsets(bindForJoint, source[16].clone().sub(source[17]).setY(0),
+      calibratedVrm || manual ? { headPitch: 0 } : undefined);
+    neutral.set({});
+    return flattenJointCorrections(edits.joints, neutral.joints, settings.retarget ?? settings.boneOffsets);
+  }
   const editTargets = new Map(Array.from(map, (i, j) => [primaryRecords[i], j]).filter(([record]) => record));
   const target = primaryRecords.map((record) => record.bindPosition.clone().applyQuaternion(align));
   const attachDriver = (i, a, b = a, weight = 0, correction = IDENTITY, lowerSpine = false) => {
@@ -323,20 +390,33 @@ export function createFbxCharacterRetarget(root, asset, motion, { poseOffsets = 
       if (!record.driver && !record.copy) {
         record.copy = { source: copy, inverse: align.clone().multiply(copy.bindRotation).invert(),
           rest: align.clone().multiply(record.bindRotation),
-          offsetBasis: record.bindRotation.clone().invert().multiply(copy.bindRotation) };
+          offsetBasis: record.bindRotation.clone().invert().multiply(copy.bindRotation),
+          parentOffsetBasis: record.parent.bindRotation.clone().invert().multiply(copy.parent.bindRotation) };
       }
     }
   }
 
   const legs = [0, 1].map((s) => ({ hip: slot(1 + s), knee: slot(4 + s), ankle: slot(7 + s), toe: slot(10 + s),
     thighGoal: new Quaternion(), kneeGoal: new Quaternion(), footGoal: new Quaternion(), toeGoal: new Quaternion() }));
-  const probes = soleProbes(root, primary, records, legs, asset.rest?.bounds);
+  const probes = cachedSoleProbes(asset, root, primary, records, legs, order, soleId(libraryId), soleSignature);
   const targetSole = Math.min(...probes.flat(2).map((item) => item.y));
   const sourceSole = Number.isFinite(restFloor) ? restFloor : Math.min(source[10].y, source[11].y) - 0.02;
   const sourceHipHeight = source[0].y - sourceSole;
   const hipDelta = slot(0).bindPosition.y - targetSole - sourceHipHeight;
   if (!Number.isFinite(hipDelta) || !(sourceHipHeight > 0)) throw new Error("Invalid FBX or motion body height.");
   const support = Number.isFinite(floor) && contacts?.length === frames * 4;
+  const proportions = manual ? measureProportions(source, target, manual, targetSole, sourceSole) : null;
+  const standing = Number.isFinite(floor) ? floor + sourceHipHeight : joints[1];
+  const rootAnchor = new Vector3(joints[0], standing, joints[2]);
+  const travelScale = proportions && new Vector3(proportions.strideRatio, proportions.heightRatio, proportions.strideRatio);
+  const rootJoint = manual && primaryRecords[manual.root];
+  const explicitControllers = manual ? Object.entries(CHAINS).flatMap(([key, chain]) => {
+    const record = primaryRecords[manual.ik[key]];
+    return record ? [{ record, end:slot(chain[2]), inverseParent:new Matrix4(), goal:new Vector3() }] : [];
+  }) : [];
+  let activeIk = !!explicitControllers.length && poseOffsets?.ikMode !== "fk";
+  let offsets = customJointEdits(manual ?? initialPose.boneOffsets);
+  const localRoot = { world:new Matrix4(), parent:new Matrix4() };
   const rootPosition = base.localPosition.clone().applyQuaternion(align);
   const rootRotation = align.clone().multiply(base.localRotation).normalize();
   const srcRotation = Array.from({ length: JOINTS }, () => new Quaternion());
@@ -383,6 +463,9 @@ export function createFbxCharacterRetarget(root, asset, motion, { poseOffsets = 
     for (const leg of legs) for (const record of [leg.hip, leg.knee, leg.ankle, leg.toe]) {
       if (record) record.override = null;
     }
+    for (const arm of arms) if (arm) {
+      arm.hip.override = arm.knee.override = arm.ankle.override = null;
+    }
     pose(false);
     let withTorso = false;
     if (neckBase && upperSpine !== lowerSpine) {
@@ -410,8 +493,35 @@ export function createFbxCharacterRetarget(root, asset, motion, { poseOffsets = 
         }
       }
     }
-    rootsAt(frame, 0, rootOffset).sub(pelvis.position);
+    rootsAt(frame, 0, rootOffset);
+    if (proportions) {
+      rootOffset.sub(rootAnchor).multiply(travelScale).add(rootAnchor);
+    }
+    rootOffset.sub(pelvis.position);
     rootOffset.y += hipDelta;
+    if (manual) {
+      let fitted = false;
+      for (const limb of [...legs, ...arms]) {
+        const [start,, end] = limb.chain;
+        desired.copy(rootsAt(frame, end, first)).sub(rootsAt(frame, start, second)).multiplyScalar(limb.ratio)
+          .add(limb.hip.position);
+        if (limb.isArm) {
+          // Keep a hand near the same head/chest landmark after changing body proportions.
+          let closest = .37, anchor = -1;
+          for (const j of [15,12,9,3]) if (slot(j)) {
+            const distance = rootsAt(frame, end, first).distanceTo(rootsAt(frame, j, second)) / limb.sourceLength;
+            if (distance < closest) { closest = distance; anchor = j; }
+          }
+          if (anchor >= 0) {
+            from.copy(rootsAt(frame, end, first)).sub(rootsAt(frame, anchor, second)).multiplyScalar(limb.ratio)
+              .add(slot(anchor).position);
+            desired.lerp(from, .75 * ease((.37 - closest) / .25));
+          }
+        }
+        fitted = pointLeg(limb, desired, frame) || fitted;
+      }
+      if (fitted) pose(withTorso);
+    }
     return withTorso;
   }
 
@@ -430,7 +540,7 @@ export function createFbxCharacterRetarget(root, asset, motion, { poseOffsets = 
     return out.set(x / list.length, y, z / list.length);
   }
 
-  function pointLeg(leg, goal) {
+  function pointLeg(leg, goal, frame = -1) {
     first.copy(leg.knee.position).sub(leg.hip.position);
     second.copy(leg.ankle.position).sub(leg.knee.position);
     axis.copy(goal).sub(leg.hip.position);
@@ -439,6 +549,15 @@ export function createFbxCharacterRetarget(root, asset, motion, { poseOffsets = 
     axis.multiplyScalar(1 / distance);
     const reach = bound(distance, Math.abs(a - b) + 0.0001, a + b - 0.0001);
     pole.copy(first).addScaledVector(axis, -first.dot(axis));
+    if (pole.lengthSq() < EPS && frame >= 0) {
+      const [start,middle] = leg.chain;
+      pole.copy(rootsAt(frame, middle, bentA)).sub(rootsAt(frame, start, bentB));
+      pole.addScaledVector(axis, -pole.dot(axis));
+      if (pole.lengthSq() < EPS) {
+        pole.set(0, 0, leg.isArm ? -1 : 1).applyQuaternion(srcRotation[0]);
+        pole.addScaledVector(axis, -pole.dot(axis));
+      }
+    }
     if (pole.lengthSq() < EPS) return false;
     const along = (reach * reach + a * a - b * b) / (2 * reach);
     bentA.copy(axis).multiplyScalar(along)
@@ -448,11 +567,22 @@ export function createFbxCharacterRetarget(root, asset, motion, { poseOffsets = 
     leg.kneeGoal.setFromUnitVectors(second.normalize(), bentB.normalize()).multiply(leg.knee.rotation);
     leg.hip.override = leg.thighGoal;
     leg.knee.override = leg.kneeGoal;
-    if (!leg.ankle.override) {
+    if (manual || !leg.ankle.override) {
       leg.ankle.override = leg.footGoal.copy(leg.ankle.rotation);
       if (leg.toe) leg.toe.override = leg.toeGoal.copy(leg.toe.rotation);
     }
     return true;
+  }
+
+  const arms = manual ? [0,1].map((s) => ({
+    hip:slot(16+s), knee:slot(18+s), ankle:slot(20+s), isArm:true,
+    thighGoal:new Quaternion(), kneeGoal:new Quaternion(), footGoal:new Quaternion(),
+  })) : [];
+  if (manual) {
+    for (const [key, chain] of Object.entries(CHAINS)) {
+      const limb = (key.endsWith("Foot") ? legs : arms)[key.startsWith("left") ? 0 : 1];
+      Object.assign(limb, { chain, ratio:proportions.lengths[key].ratio, sourceLength:proportions.lengths[key].from });
+    }
   }
 
   const spans = support ? Array.from({ length: 4 }, () => new Int32Array(frames).fill(-1)) : [];
@@ -517,18 +647,18 @@ export function createFbxCharacterRetarget(root, asset, motion, { poseOffsets = 
         if (anchor && !deep) {
           // The capture already has foot correction. Nudge residual drift
           // without pulling a moving foot hard back to its first contact.
-          const lock = 0.35 * weight * ease(Math.min(frame - start + 1, spanEnds[i].get(start) - frame) / 4);
+          const lock = (manual ? .95 : .35) * weight * ease(Math.min(frame - start + 1, spanEnds[i].get(start) - frame) / 4);
           correction.x += (anchor.x - p.x) * lock;
           correction.z += (anchor.z - p.z) * lock;
           locks += lock;
         }
       }
       if (!confidence) continue;
-      correction.multiplyScalar(1 / Math.max(1, locks)).clampLength(0, 0.07);
+      correction.multiplyScalar(1 / Math.max(1, locks)).clampLength(0, manual ? legLimit(s) : 0.07);
       const maxY = deep ? 0.045 : 0.13;
       correction.y = bound(floor - ground, -maxY, maxY) * confidence;
       if (correction.lengthSq() > 1e-6) {
-        adjusted = pointLeg(legs[s], desired.copy(legs[s].ankle.position).add(correction)) || adjusted;
+        adjusted = pointLeg(legs[s], desired.copy(legs[s].ankle.position).add(correction), manual ? frame : -1) || adjusted;
       }
     }
     if (adjusted) pose(withTorso);
@@ -545,6 +675,7 @@ export function createFbxCharacterRetarget(root, asset, motion, { poseOffsets = 
       rootOffset.y += bound(floor - ground, -margin, margin) * confidence;
     }
   }
+  const legLimit = (s) => .18 * proportions.lengths[s ? "rightFoot" : "leftFoot"].to;
 
   // Fixed targets are captured from this character's uncorrected first
   // contact frame, so scrubbing produces the same pose as playing in order.
@@ -568,6 +699,11 @@ export function createFbxCharacterRetarget(root, asset, motion, { poseOffsets = 
   function setPoseOffsets(settings) {
     const pose = poseSettings(settings);
     edits.set(pose);
+    offsets = customJointEdits(manual ? pose.retarget ?? manual : pose.boneOffsets);
+    if (manual) {
+      activeIk = !!explicitControllers.length && pose.ikMode !== "fk";
+      pose.ikMode = activeIk ? "ik" : "fk";
+    }
     lastFrame = -1;
     return pose;
   }
@@ -588,15 +724,63 @@ export function createFbxCharacterRetarget(root, asset, motion, { poseOffsets = 
         else node.quaternion.multiply(change);
         node.quaternion.normalize();
       }
+      const rotationOffset = offsets.rotation.get(joint);
+      if (rotationOffset && (!copy || !manual)) {
+        if (copy) node.quaternion.multiply(delta.copy(copy.offsetBasis).multiply(rotationOffset).multiply(inverse.copy(copy.offsetBasis).invert()));
+        else node.quaternion.multiply(rotationOffset);
+        node.quaternion.normalize();
+      }
+      node.position.copy(record.localPosition);
+      const position = offsets.translation.get(joint);
+      if (position && (!copy || !manual)) {
+        if (copy) node.position.addScaledVector(point.copy(position).applyQuaternion(copy.parentOffsetBasis), 1 / record.parent.scale.x);
+        else node.position.addScaledVector(position, 1 / record.parent.scale.x);
+      }
       if (!node.matrixAutoUpdate) node.updateMatrix();
+    }
+    if (rootJoint && !rootJoint.driver && !rootJoint.copy) {
+      rootJoint.node.position.copy(rootJoint.localPosition);
+      rootJoint.node.quaternion.copy(rootJoint.localRotation);
+      rootJoint.node.scale.copy(rootJoint.localScale);
+      rootJoint.node.updateMatrix();
     }
     root.quaternion.multiplyQuaternions(edits.rootRotation, rootRotation);
     edits.position(rootPosition, rootOffset, pelvis.position, root.position);
     if (!root.matrixAutoUpdate) root.updateMatrix();
+    if (rootJoint || explicitControllers.length) {
+      root.updateWorldMatrix(true, true);
+      if (rootJoint) {
+        // Put the root track on the chosen common ancestor while keeping
+        // the same scene pose, including the model's unit normalization.
+        const chosen = rootJoint.node, parent = chosen.parent;
+        localRoot.world.copy(chosen.matrixWorld);
+        root.position.copy(base.localPosition);
+        root.quaternion.copy(base.localRotation);
+        root.updateMatrix();
+        root.updateWorldMatrix(true, true);
+        const local = localRoot.parent.copy(parent.matrixWorld).invert().multiply(localRoot.world);
+        local.decompose(chosen.position, chosen.quaternion, chosen.scale);
+        chosen.updateMatrix();
+        chosen.updateWorldMatrix(false, true);
+      }
+      for (const { record, end, inverseParent, goal } of explicitControllers) {
+        const node = record.node;
+        node.position.copy(record.localPosition);
+        node.quaternion.copy(record.localRotation);
+        if (activeIk) {
+          end.node.getWorldPosition(goal);
+          node.position.copy(goal.applyMatrix4(inverseParent.copy(node.parent.matrixWorld).invert()));
+        }
+        node.updateMatrix();
+        node.updateWorldMatrix(false, true);
+      }
+    }
     primary.updateConstraints?.();
     lastFrame = frame;
     return true;
   }
-  return { apply, setPoseOffsets, mirrorRotation: edits.mirrorRotation, matched: map.filter((i) => i >= 0).length,
-    sourceToTarget: Array.from(map), support };
+  return { apply, setPoseOffsets, editableCorrections, mirrorRotation: edits.mirrorRotation, matched: map.filter((i) => i >= 0).length,
+    sourceToTarget: Array.from(map), support, proportions, nativeIkAvailable:!!explicitControllers.length,
+    rootMotionScale:proportions?.strideRatio,
+    rememberLibraryId: (id) => cacheLibrarySoles(soleId(id), soleCache.get(asset)) };
 }

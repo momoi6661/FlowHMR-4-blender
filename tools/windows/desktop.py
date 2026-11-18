@@ -4,6 +4,7 @@ import argparse
 import ctypes
 from ctypes import wintypes
 from html import escape
+from http.client import HTTPConnection, HTTPException
 import json
 import logging
 import os
@@ -14,7 +15,6 @@ import subprocess
 import sys
 import threading
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
 from uuid import uuid4
 
 import webview
@@ -116,13 +116,18 @@ class DesktopBackend:
 def status_page(state):
     language = read_language()
     heading, detail = MESSAGES[language][state]
+    # Startup waits for the local HTTP service. Models are loaded on demand,
+    # so a staged percentage would claim work the launcher isn't doing.
+    progress = (f'<progress aria-label="{escape(heading, quote=True)}"></progress>'
+                if state in ("starting", "switching") else "")
     return f"""<!doctype html><html lang="{language}"><meta charset="utf-8">
 <style>
 body {{margin:0;display:grid;place-items:center;min-height:100vh;background:#252525;color:#ededed;
        font:14px 'Segoe UI','Microsoft YaHei',sans-serif}}
 main {{width:min(480px,85%);padding:24px;background:#303030;border:1px solid #454545;border-radius:5px}}
 h1 {{font-size:18px;margin:0 0 12px}} p {{margin:0;color:#bbb;line-height:1.6}}
-</style><main><h1>{escape(heading)}</h1><p>{escape(detail)}</p></main></html>"""
+progress {{display:block;width:100%;height:.6rem;margin-top:1rem;accent-color:#5886b7}}
+</style><main><h1>{escape(heading)}</h1><p>{escape(detail)}</p>{progress}</main></html>"""
 
 
 def open_models_folder():
@@ -167,8 +172,39 @@ def create_file_picker(window, port, backend):
     return choose
 
 
+def register_character_file(port, key, path):
+    # This authenticated request is local IPC. Do not use an HTTP proxy or
+    # follow redirects, which could send the path and session key elsewhere.
+    connection = HTTPConnection("127.0.0.1", port, timeout=10)
+    try:
+        connection.request(
+            "POST", "/api/desktop/character-file",
+            json.dumps({"file": path}, ensure_ascii=False).encode("utf-8"),
+            {"Content-Type": "application/json", "X-FlowHMR-Desktop-Key": key},
+        )
+        with connection.getresponse() as response:
+            if response.status != 200:
+                logging.warning("Local character picker returned HTTP %d", response.status)
+                if response.status == 403:
+                    return {"error_code": "character_picker_session"}
+                if response.status in (400, 413):
+                    return {"error_code": "character_picker_invalid"}
+                return {"error_code": "character_picker_retry"}
+            data = json.loads(response.read(16384))
+        if isinstance(data, dict) and all(isinstance(data.get(k), str) and data[k] for k in ("ticket", "name")):
+            return {"ticket": data["ticket"], "name": data["name"]}
+        logging.warning("Local character picker did not return a file ticket")
+    except (OSError, HTTPException) as error:
+        logging.warning("Local character picker connection failed (%s, errno=%s)",
+                        type(error).__name__, getattr(error, "winerror", None) or getattr(error, "errno", None))
+    except (ValueError, RecursionError):
+        logging.warning("Local character picker returned invalid JSON")
+    finally:
+        connection.close()
+    return {"error_code": "character_picker_retry"}
+
+
 def expose_model_pickers(window, port, backend, choose):
-    origin = f"http://127.0.0.1:{port}"
 
     def choose_model_folder():
         return choose(webview.FileDialog.FOLDER)
@@ -180,14 +216,8 @@ def expose_model_pickers(window, port, backend, choose):
         path = choose(webview.FileDialog.OPEN, ("PMX VRM FBX (*.pmx;*.vrm;*.fbx)",))
         if not path:
             return None
-        payload = json.dumps({"file": path}).encode("utf-8")
-        req = Request(origin + "/api/desktop/character-file", data=payload,
-                      headers={"Content-Type": "application/json", "X-FlowHMR-Desktop-Key": backend.character_key})
-        try:
-            with urlopen(req, timeout=10) as result:
-                return json.load(result)
-        except (OSError, ValueError):
-            return {"error": "character_file"}
+        result = register_character_file(port, backend.character_key, path)
+        return result if "error_code" not in result else {"error": "character_file", **result}
 
     window.expose(choose_model_folder, choose_model_archive, choose_character_file)
 
@@ -210,6 +240,39 @@ def expose_language_preference(window, port, backend):
             return False
 
     window.expose(get_ui_language, set_ui_language)
+
+
+def expose_mcp(window, port, backend):
+    def request(path, body=None):
+        current = urlsplit(window.get_current_url() or "")
+        if backend.closed.is_set() or (current.scheme, current.netloc) != ("http", f"127.0.0.1:{port}"):
+            return None
+        connection = HTTPConnection("127.0.0.1", port, timeout=1210 if body and body.get("action") == "stop" else 30)
+        headers = {"X-FlowHMR-Desktop-Key": backend.character_key, "Content-Type": "application/json"}
+        try:
+            if body is None:
+                connection.request("GET", path, headers=headers)
+            else:
+                connection.request("POST", path, json.dumps(body).encode("utf-8"), headers=headers)
+            with connection.getresponse() as response:
+                data = response.read()
+                if response.status != 200 and not response.getheader("Content-Type", "").startswith("application/json"):
+                    return {"error": f"HTTP {response.status}"}
+                return json.loads(data)
+        except (OSError, HTTPException, ValueError):
+            logging.exception("Could not access the desktop MCP service")
+            return None
+        finally:
+            connection.close()
+
+    def mcp_settings(body=None):
+        if body is None or isinstance(body, dict):
+            return request("/api/mcp", body)
+
+    def mcp_activity():
+        return request("/api/mcp/activity")
+
+    window.expose(mcp_settings, mcp_activity)
 
 
 def expose_updates(window, port, backend, trial_ready, choose):
@@ -288,6 +351,22 @@ def connect(window, port, backend, *, trial=False):
         return False
 
 
+def get_backend_json(port, path, timeout):
+    # These probes must reach the local backend even when a system proxy is set.
+    connection = HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        connection.request("GET", path)
+        with connection.getresponse() as response:
+            if response.status != 200:
+                raise OSError(f"Local backend returned HTTP {response.status}")
+            data = json.loads(response.read(512 * 1024))
+        if not isinstance(data, dict):
+            raise ValueError("Invalid local backend response")
+        return data
+    finally:
+        connection.close()
+
+
 def expose_runtime_restart(window, port, backend):
     restart_lock = threading.Lock()
     url = f"http://127.0.0.1:{port}"
@@ -316,9 +395,8 @@ def expose_runtime_restart(window, port, backend):
         if f"{current.scheme}://{current.netloc}" != url:
             return False
         try:
-            with urlopen(url + "/api/runtime", timeout=5) as response:
-                pending = json.load(response).get("pending_restart", False)
-        except (OSError, ValueError):
+            pending = get_backend_json(port, "/api/runtime", timeout=5).get("pending_restart", False)
+        except (OSError, HTTPException, ValueError, RecursionError):
             return False
         if not pending or backend.closed.is_set() or not restart_lock.acquire(blocking=False):
             return False
@@ -347,11 +425,10 @@ def desktop_port(requested):
                 port = listener.getsockname()[1]
         except OSError:
             try:
-                with urlopen(f"http://127.0.0.1:{port}/api/info", timeout=.8) as response:
-                    directory = json.load(response)["model_files"]["directory"]
+                directory = get_backend_json(port, "/api/info", timeout=.8)["model_files"]["directory"]
                 if Path(directory).resolve() != (ROOT / "models").resolve():
                     continue
-            except (OSError, ValueError, KeyError, TypeError):
+            except (OSError, HTTPException, ValueError, RecursionError, KeyError, TypeError):
                 continue
         marker.parent.mkdir(exist_ok=True)
         marker.write_text(str(port), encoding="ascii")
@@ -416,6 +493,7 @@ def main():
         choose_file = create_file_picker(window, port, backend)
         expose_model_pickers(window, port, backend, choose_file)
         expose_language_preference(window, port, backend)
+        expose_mcp(window, port, backend)
         expose_runtime_restart(window, port, backend)
         trial_ready = threading.Event() if os.environ.get("FLOWHMR_UPDATE_TRIAL") == "1" else None
         trial_failed = threading.Event()

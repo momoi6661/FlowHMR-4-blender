@@ -2,6 +2,44 @@
 
 Notable changes to FlowHMR.
 
+## Windows v0.3.6
+
+- Add a floating 3D retargeting editor with guided body and finger mapping, automatic mirroring, limb proportion matching, and reusable presets.
+- Show character and preset thumbnails. Preserve each character's own settings and provide editable built-in presets.
+- Export to an applied Mixamo or MetaHuman character without selecting another FBX. Export custom and recognized FBX characters on their original skeletons with baked corrections and optional skin, one person at a time with scene placement and entry time preserved. Keep generic Mixamo export and animated GLB for custom-mapped VRM rigs.
+- Let compatible PMX rigs switch between native IK and FK. Prefer MMD Center, then All Parent, when selecting a root automatically.
+- Keep the applied character's joint and root corrections and foot IK/FK when exporting a generic VMD under standard MMD bone names.
+- Interpolate slow preview playback and remember the timeline display rate without changing export timing. Fix FBX foot alignment and VRM spring-bone collider cloning.
+- Add experimental Windows ROCm packages for Radeon RX 6000. Keep inference runtime initialization deferred until a job starts.
+- Keep the MCP tool and background export contracts compatible, allow IK switches on custom FBX/VRM rigs with mapped controllers, and report the active device backend.
+
+## Windows v0.3.5
+
+- Add experimental CPU-only inference and Intel XPU image encoding. Recommend CUDA 12.8 for RTX 50 and CUDA 12.1 for RTX 20, 30, and 40, and expand ROCm runtime selection to more Radeon devices.
+- Reduce SAM memory overhead and offer CPU image encoding with GPU pose decoding on supported AMD integrated systems. Run moving-camera estimation on the CPU in AMD integrated GPU mode.
+- Run person detection within the selected frame range while preserving source timestamps and frame numbers for preview and scene alignment.
+- Bypass the system proxy for local desktop character requests and report session, file, and connection errors separately.
+
+## Windows v0.3.4
+
+- Fix multi-person scene alignment in low-VRAM mode by loading SAM on the GPU for scene sampling and returning it to the CPU afterward, including on cancellation.
+- Document minimum system requirements and distinguish built-in runtimes from community-tested devices.
+
+## Windows v0.3.3
+
+- Adjust SAM batches using measured peak VRAM and available system memory. Retry smaller batches after allocation errors.
+- Add SAM hand sampling at intervals of 1, 2, or 4 frames and a local MCP service for tasks, playback, characters, and export.
+- Restore remote Web progress updates and fix FBX export for automatically selected single-person jobs through MCP.
+
+## [2026-11-11]
+
+### Added
+
+- Sparse SAM hand sampling (`--sam_hand_stride`; Web **SAM hand sampling**) in the CLI and Web demo:
+  decode both SAM hand decoders on one seeded frame per N frames and linearly interpolate the
+  remaining hand tokens. `2`/`4` reduce SAM time on long clips at a small finger-detail cost;
+  no new weights or runtime changes. An existing stride-1/2/4 SAM cache is invalidated automatically.
+
 ## [2026-10-31]
 
 ### Added

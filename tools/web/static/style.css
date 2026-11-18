@@ -129,6 +129,7 @@ body { display: flex; flex-direction: column; height: 100vh; }
 .input:hover:not(:focus), .select:hover:not(:focus) { border-color: rgba(0, 0, 0, 0.15); }
 .input:focus, .select:focus { outline: none; border-color: #d1d5db; box-shadow: 0 0 0 3px rgba(209, 213, 219, 0.6); }
 .select { width: auto; padding: 6px 10px; font-size: 12px; border-radius: 10px; }
+.setting-select.input { width: auto; min-width: 128px; padding: 5px 8px; font-size: 12px; border-radius: 10px; }
 
 .toggle {
   position: relative; display: inline-flex; flex-shrink: 0; width: 40px; height: 22px; padding: 0;
@@ -255,9 +256,12 @@ body { display: flex; flex-direction: column; height: 100vh; }
   border-radius: 10px; overflow: hidden; background: #0f1115;
 }
 .preview-stage video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+.preview-stage img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+.source-image-options { margin-top: 10px; }
+.source-image-options > select { margin-top: 6px; }
 #previewCanvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 #previewCanvas.pickable { pointer-events: auto; cursor: pointer; }
-#previewVideo[controls] + #previewCanvas { clip-path: inset(0 0 40px); }
+#previewVideo[controls] ~ #previewCanvas { clip-path: inset(0 0 40px); }
 .card.attention { box-shadow: 0 0 0 2px #fbbf24, var(--shadow); }
 
 /* ---------------------------------------------------------------- result / viewer */
@@ -265,6 +269,7 @@ body { display: flex; flex-direction: column; height: 100vh; }
 .downloads { display: flex; gap: 8px; }
 .viewer-wrap { position: relative; flex: 1; min-height: 320px; border-radius: 12px; overflow: hidden; border: 1px solid var(--line); background: #fbfbfc; }
 #viewer { position: absolute; inset: 0; }
+#viewer:focus-visible { outline: 1px solid var(--active); outline-offset: -1px; }
 #viewer canvas { display: block; width: 100%; height: 100%; }
 .viewer-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 24px; text-align: center; color: var(--faint); font-size: 14px; pointer-events: none; }
 .viewer-tools {
@@ -382,3 +387,14 @@ body { display: flex; flex-direction: column; height: 100vh; }
   .topbar-actions { gap: 6px; }
   .model-info { max-width: 44vw; overflow: hidden; text-overflow: ellipsis; }
 }
+/* MCP connection settings use the existing model dialog shell. */
+.mcp-fields { display: grid; gap: 14px; margin: 20px 16px; }
+#mcpDialog > .model-hint { margin: 16px; }
+.mcp-fields > label:not(.mcp-reveal) { display: grid; grid-template-columns: 110px minmax(0, 1fr); align-items: center; gap: 12px; }
+.mcp-fields input { width: 100%; box-sizing: border-box; }
+.mcp-fields .mcp-reveal { display: flex; align-items: center; gap: 8px; }
+.mcp-reveal input { width: auto; }
+#mcpStatus { overflow-wrap: anywhere; }
+.mcp-activity-list { max-height: 180px; overflow: auto; font-size: 12px; overflow-wrap: anywhere; }
+.mcp-activity-item { padding: 6px 0; border-bottom: 1px solid var(--line); }
+#mcpActivityStatus { max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

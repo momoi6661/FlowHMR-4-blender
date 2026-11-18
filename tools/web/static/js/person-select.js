@@ -3,7 +3,7 @@
 //    preview, frame count); toggle any rows or video boxes, then confirm together.
 //  - locked:   each queued or finished job shows its own selected person.
 import { $, show, el, personColor } from "./utils.js";
-import { message as m, setAttr, setText } from "./i18n.js";
+import { appError, message as m, setAttr, setText } from "./i18n.js";
 import * as api from "./api.js";
 
 const CHECK_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
@@ -17,6 +17,7 @@ export function initPersonSelect(bus) {
   let rows = [];
   let mode = "hidden";      // "hidden" | "choosing" | "locked"
   let submitting = false, confirmed = false;
+  let boxEdits = [];
 
   const list = $("personList");
 
@@ -45,24 +46,32 @@ export function initPersonSelect(bus) {
       chip.style.background = personColor(i);
       name.append(chip, el("span", "", m("person.number", { number: i + 1 })), tag);
       text.append(name, el("span", "person-meta num",
-        m("person.track_duration", { frames: c.num_frames, seconds: (c.num_frames / 30).toFixed(1), start: c.start + 1, end: c.end + 1 })));
+        c.static_image ? m("image.result") : m("person.track_duration", {
+          frames: c.num_frames, seconds: (c.num_frames / 30).toFixed(1), start: c.start + 1, end: c.end + 1 })));
       btn.append(text);
       const mark = el("span", "person-check");
       mark.innerHTML = CHECK_SVG;
       btn.append(mark);
       btn.addEventListener("click", () => togglePerson(i));
-      list.append(btn);
-      return { btn, tag };
+      const entry = el("div", "person-entry");
+      const edit = el("button", "btn-secondary small person-edit");
+      edit.type = "button";
+      setText(edit, m("box.edit"));
+      edit.addEventListener("click", () => { previewIndex = i; bus.emit("person:edit-box", i); });
+      entry.append(btn, edit);
+      list.append(entry);
+      return { btn, tag, edit };
     });
     syncChoosing();
   }
 
   function syncChoosing() {
-    rows.forEach(({ btn, tag }, i) => {
+    rows.forEach(({ btn, tag, edit }, i) => {
       const checked = selected.has(i);
       btn.classList.toggle("selected", checked);
       btn.setAttribute("aria-pressed", String(checked));
       btn.disabled = submitting || confirmed;
+      edit.disabled = submitting || confirmed;
       setText(tag, i === previewIndex ? m("person.previewing") : i === defaultIdx ? m("common.recommended") : "");
       show(tag, !!tag.textContent);
     });
@@ -85,8 +94,8 @@ export function initPersonSelect(bus) {
     name.append(chip, el("span", "", m("person.number", { number: lockedIndex + 1 })));
     const how = m(job.selection_auto ? "person.chosen_auto" : "person.chosen_manual");
     text.append(name, el("span", "person-meta", how));
-    if (candidate) text.append(el("span", "person-meta num",
-      m("person.track", { frames: candidate.num_frames, start: candidate.start + 1, end: candidate.end + 1 })));
+    if (candidate) text.append(el("span", "person-meta num", candidate.static_image ? m("image.result")
+      : m("person.track", { frames: candidate.num_frames, start: candidate.start + 1, end: candidate.end + 1 })));
     row.append(text);
     list.append(row);
   }
@@ -106,7 +115,8 @@ export function initPersonSelect(bus) {
     setError("");
     syncChoosing();
     try {
-      const result = await api.selectPeople(id, [...selected]);
+      if (boxEdits.length && !(await api.getInfo()).blender_bridge?.manual_boxes) throw appError("box.backend_reload");
+      const result = await api.selectPeople(id, [...selected], boxEdits);
       if (jobId !== id) return;
       confirmed = true;
       bus.emit("person:confirmed", result.people ?? [...selected]);
@@ -140,6 +150,14 @@ export function initPersonSelect(bus) {
   }
 
   $("personReselect").addEventListener("click", () => bus.emit("person:reselect"));
+  $("boxReset").addEventListener("click", () => { boxEdits = []; bus.emit("person:reset-boxes"); });
+  bus.on("preview:box-edits", ({ edits, person }) => {
+    if (mode !== "choosing" || submitting || confirmed) return;
+    boxEdits = edits;
+    selected.add(person);
+    syncChoosing();
+    bus.emit("person:selection", { selected: [...selected], previewIndex: person });
+  });
 
   return {
     /** Called on every job poll. */
@@ -151,6 +169,7 @@ export function initPersonSelect(bus) {
         candidates = [];
         defaultIdx = previewIndex = lockedIndex = null;
         selected.clear();
+        boxEdits = [];
         submitting = confirmed = false;
         setError("");
       }
@@ -184,6 +203,7 @@ export function initPersonSelect(bus) {
     reset() {
       jobId = null; candidates = []; defaultIdx = previewIndex = lockedIndex = null;
       selected.clear();
+      boxEdits = [];
       submitting = confirmed = false;
       setError("");
       setMode("hidden");

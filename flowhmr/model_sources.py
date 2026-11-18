@@ -63,6 +63,11 @@ PUBLIC_ASSETS = {
         _flowhmr_asset(files.FLOWHMR_CONFIG, 3067, "5deae01800c031975558bf9675819e8d1e24803414f692b8b5c2196b266c64d7"),
         _flowhmr_asset(files.FLOWHMR_CKPT, 1841702021, "b7eb06b119feaf5ad7287bafdb2fff38d42dfc22ea9d256f8cdd2ada26dfc53a"),
     ),
+    # Optional base checkpoint for the torso-motion optimization (same official repo).
+    "flowhmr_base": (
+        _flowhmr_asset(files.FLOWHMR_BASE_CONFIG, 2227, "2dc27e1216606fe0d50882f3bc92603004974acaccf4919b159908312a2f491e"),
+        _flowhmr_asset(files.FLOWHMR_BASE_CKPT, 1841700869, "77b903ba545669bafd6f7709c0f1748f5fa030a4f25f67392c8c082a21f5e672"),
+    ),
     "yolox": (Asset(files.YOLOX, 434357141, "1e6b7fa6240375370b2a8a8eab9066b3cdd43fd1d0bfa8d2027fd3a51def2917", (YOLOX_URL,)),),
     "sam": _perception_assets[:3],
     "vggt": _perception_assets[3:],

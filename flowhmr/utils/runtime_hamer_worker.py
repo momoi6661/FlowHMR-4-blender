@@ -13,6 +13,42 @@ def _progress(frame, message):
     print("@@HAMER@@" + json.dumps({"frame": frame, "message": message}), flush=True)
 
 
+def _gpu_memory_error(error):
+    import torch
+
+    return isinstance(error, torch.cuda.OutOfMemoryError) or any(
+        phrase in str(error).lower() for phrase in (
+            "cuda out of memory", "cuda error: out of memory", "cuda driver error: out of memory",
+            "hip out of memory", "hip error: out of memory", "hiperroroutofmemory",
+            "cublas_status_alloc_failed", "cudnn_status_alloc_failed",
+        )
+    )
+
+
+def _initial_batch_size(free, total):
+    # Keep activations conservative while the main FlowHMR model stays loaded.
+    # The OOM retry below can shrink batches further on larger cards.
+    gib = 1024 ** 3
+    if total <= 8 * gib:
+        return 1
+    return max(1, min(8, (free - 2 * gib) // (512 * 1024 ** 2)))
+
+
+def _predict_with_retry(items, batch_size, predict, clear_memory, on_reduce):
+    while True:
+        batch = items[:batch_size]
+        try:
+            return batch, predict(batch), batch_size
+        except RuntimeError as error:
+            if not _gpu_memory_error(error) or len(batch) <= 1:
+                raise
+            batch_size = max(1, len(batch) // 2)
+        # Exit the exception scope first, so the failed forward's tensors die
+        # before the allocator is cleared and the same crops are retried.
+        clear_memory()
+        on_reduce(batch_size)
+
+
 def _runs(mask):
     import numpy as np
 
@@ -56,6 +92,7 @@ def _fill_sampled_rotations(rotations, valid, sampled):
 
 def _load_model(device):
     import torch
+    from accelerate import init_empty_weights
     from yacs.config import CfgNode
 
     from flowhmr.core.bodymodels.licensed_data import read_registered_arrays
@@ -87,15 +124,24 @@ def _load_model(device):
         cfg.MODEL.BBOX_SHAPE = [192, 256]
     cfg.MODEL.BACKBONE.pop("PRETRAINED_WEIGHTS", None)
     cfg.freeze()
-    with torch.device("cpu"):
+    # Parameter registration on meta avoids committing a second full ViT copy
+    # on Windows. Keep ordinary tensor factories on CPU: the upstream ViT reads
+    # scalar drop-path values with .item() during construction.
+    print("  [hamer] constructing empty model", flush=True)
+    with init_empty_weights(include_buffers=False):
         backbone = create_backbone(cfg)
         head = build_mano_head(cfg)
+    print("  [hamer] mapping checkpoint", flush=True)
     with torch.serialization.safe_globals([CfgNode]):
-        state = torch.load(checkpoint, map_location="cpu", weights_only=True)["state_dict"]
+        state = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)["state_dict"]
     for module, prefix in ((backbone, "backbone."), (head, "mano_head.")):
+        # Assign file-backed tensors instead of retaining a second full CPU copy.
+        # Keep GPU weights in inference precision too: FP32 weights plus autocast's
+        # FP16 cache exceeded the Windows memory budget on 6 GiB cards.
         module.load_state_dict({name.removeprefix(prefix): value for name, value in state.items()
-                                if name.startswith(prefix)}, strict=True)
-        module.to(device)
+                                if name.startswith(prefix)}, strict=True, assign=True)
+        print(f"  [hamer] transferring {prefix.rstrip('.')} to GPU (FP16)", flush=True)
+        module.to(device=device, dtype=torch.float16)
         module.eval()
     del state
     return backbone, head, cfg
@@ -152,8 +198,8 @@ def run(video, boxes_path, start, gpu, target, stride=1):
 
             _progress(0, "正在加载 HaMeR 手指模型")
             device = torch.device("cuda", gpu)
-            configure_windows_hip(torch, attention=True)
             torch.cuda.set_device(device)
+            configure_windows_hip(torch, device=device, attention=True)
             backbone, head, cfg = _load_model(device)
             mean = 255 * np.asarray(cfg.MODEL.IMAGE_MEAN, dtype=np.float32)[:, None, None]
             std = 255 * np.asarray(cfg.MODEL.IMAGE_STD, dtype=np.float32)[:, None, None]
@@ -169,25 +215,25 @@ def run(video, boxes_path, start, gpu, target, stride=1):
                 params, _, _ = head(features)
                 return params["hand_pose"].float().cpu().numpy()
 
-            prepared_size = batch_size = 8  # Hand crops, independent of the SAM frame batch.
+            prepared_size = 8  # CPU crop prefetch, independent of the GPU batch.
+            torch.cuda.empty_cache()
+            free, total = torch.cuda.mem_get_info(device)
+            batch_size = _initial_batch_size(free, total)
+            print(f"  [hamer] GPU batch={batch_size}, free={free // 1024 ** 2} MiB "
+                  f"of {total // 1024 ** 2} MiB", flush=True)
+
+            def clear_memory():
+                torch.clear_autocast_cache()
+                torch.cuda.empty_cache()
 
             def infer_prepared(items):
                 nonlocal batch_size
                 offset = 0
                 while offset < len(items):
-                    batch = items[offset:offset + batch_size]
-                    failed = False
-                    try:
-                        hands = predict(batch)
-                    except torch.cuda.OutOfMemoryError:
-                        if batch_size == 1:
-                            raise
-                        failed = True
-                    if failed:
-                        batch_size = max(1, batch_size // 2)
-                        torch.clear_autocast_cache()
-                        torch.cuda.empty_cache()
-                        continue
+                    batch, hands, batch_size = _predict_with_retry(
+                        items[offset:], batch_size, predict, clear_memory,
+                        lambda size: _progress(items[offset][0], f"HaMeR 显存不足，缩小为每批 {size} 只手后重试"),
+                    )
                     for (frame, side, _), hand in zip(batch, hands):
                         if not np.isfinite(hand).all():
                             valid[frame, side] = False
@@ -219,7 +265,7 @@ def run(video, boxes_path, start, gpu, target, stride=1):
                         pending = []
 
             # Decode and crop ahead on CPU while the previous batch is on GPU.
-            # Keep autocast's FP16 copies of the weights between batches.
+            # Autocast handles float input crops; model weights are already FP16.
             last_progress = 0.
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
                 for current, items in _prefetch(prepare_batches()):
@@ -250,9 +296,11 @@ def run(video, boxes_path, start, gpu, target, stride=1):
 
 
 if __name__ == "__main__":
+    import faulthandler
+    faulthandler.enable()
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from flowhmr.runtime_environments import RUNTIME
 
-    RUNTIME.configure_process()
-    video, boxes, start, gpu, target, stride = sys.argv[1:]
+    video, boxes, start, gpu, target, stride, *runtime = sys.argv[1:]
+    RUNTIME.configure_process(name=runtime[0] if runtime else None)
     run(Path(video), Path(boxes), int(start), int(gpu), Path(target), int(stride))

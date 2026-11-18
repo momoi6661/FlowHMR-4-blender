@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from threading import Thread
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -26,6 +27,23 @@ HAMER_ISSUES = {
     "hamer_mano_missing": "缺少 MANO v1.2。请从 MANO 官网下载「Models & Code（mano_v1_2.zip）」并导入。",
     "hamer_mano_invalid": "MANO_RIGHT.pkl 不完整或不是原版 MANO v1.2。请用 MANO 官网「Models & Code（mano_v1_2.zip）」中的原文件替换。",
 }
+
+
+def _worker_error_message(lines, returncode=None):
+    """Report the CUDA/ Python exception, rather than its trailing debug advice."""
+    if any("out of memory" in line.lower() or "hiperroroutofmemory" in line.lower() for line in lines):
+        return "HaMeR 显存不足，请释放其他程序占用的显存后重试。"
+    exception = next((line for line in reversed(lines) if re.search(r"\b[\w.]*(?:Error|Exception):", line)), None)
+    if exception:
+        return exception.strip()
+    if returncode is not None:
+        code = returncode & 0xFFFFFFFF
+        if code in {0xC0000017, 0xC000009A}:
+            return f"HaMeR 进程可用系统内存不足（0x{code:08X}），请查看任务目录中的 hamer-worker.log。"
+        if code == 0xC0000005:
+            return "HaMeR 底层推理进程发生访问冲突（0xC0000005），请查看任务目录中的 hamer-worker.log。"
+        return f"HaMeR 子进程异常退出（代码 {returncode}），请查看任务目录中的 hamer-worker.log。"
+    return "HaMeR 子进程未返回有效错误信息，请查看后台日志。"
 
 
 def _mano_v12_issue(path):
@@ -121,6 +139,10 @@ def refine_fingers(video_path, hand_boxes_path, start_frame, output, *, device,
     import numpy as np
     import torch
 
+    from flowhmr.runtime_environments import RUNTIME
+    from flowhmr.runtime_rocm import uses_shared_memory
+    from flowhmr.utils.sam_batch import MIB, require_shared_ram
+
     if type(stride) is not int or stride not in HAMER_STRIDES:
         raise ValueError("HaMeR 采样间隔须为 1、2、3 或 4 帧。")
     model_paths, issue = hamer_model_status(device)
@@ -132,6 +154,8 @@ def refine_fingers(video_path, hand_boxes_path, start_frame, output, *, device,
     with torch.cuda.device(device):
         gpu = torch.cuda.current_device()
         torch.cuda.empty_cache()
+    if uses_shared_memory(torch, device):
+        require_shared_ram(2 * model_paths[0].stat().st_size + 512 * MIB)
     video = Path(video_path).resolve()
     worker = Path(__file__).with_name("runtime_hamer_worker.py")
     frames = output["rot6d"].shape[1]
@@ -144,19 +168,45 @@ def refine_fingers(video_path, hand_boxes_path, start_frame, output, *, device,
         target = Path(temp) / "fingers.npz"
         command = [sys.executable, "-I", "-B", "-X", "utf8", "-u", str(worker), str(video),
                    str(Path(hand_boxes_path).resolve()), str(start_frame), str(gpu), str(target), str(stride)]
+        if RUNTIME.active is not None:
+            command.append(RUNTIME.active)  # Keep the parent's GPU runtime in the isolated interpreter.
         events = Queue()
         tail = deque(maxlen=24)
         with subprocess.Popen(command, cwd=temp, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               text=True, encoding="utf-8", errors="replace",
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as child:
             def read_output():
+                log = None
                 try:
+                    try:
+                        log = (video.parent / "hamer-worker.log").open("a", encoding="utf-8")
+                    except OSError:
+                        pass
                     for line in child.stdout:
+                        # Log IO must never stop draining the child pipe.
+                        if log is not None:
+                            try:
+                                log.write(line)
+                                log.flush()
+                            except OSError:
+                                try:
+                                    log.close()
+                                except OSError:
+                                    pass
+                                log = None
                         if line.startswith(PROGRESS_PREFIX):
-                            events.put(json.loads(line[len(PROGRESS_PREFIX):]))
+                            try:
+                                events.put(json.loads(line[len(PROGRESS_PREFIX):]))
+                            except ValueError:
+                                tail.append(line.rstrip())
                         else:
                             tail.append(line.rstrip())
                 finally:
+                    if log is not None:
+                        try:
+                            log.close()
+                        except OSError:
+                            pass
                     events.put(None)
 
             reader = Thread(target=read_output, daemon=True)
@@ -173,10 +223,11 @@ def refine_fingers(video_path, hand_boxes_path, start_frame, output, *, device,
                         break
                     if on_progress is not None:
                         on_progress(event["frame"], frames, event["message"])
-                if child.wait() != 0:
+                returncode = child.wait()
+                if returncode != 0:
                     detail = "\n".join(tail)[-4000:]
                     print(f"  [hamer] worker error:\n{detail}", flush=True)
-                    raise RuntimeError(f"HaMeR 手指精修失败：{next((line for line in reversed(tail) if line), '请查看后台日志。')}")
+                    raise RuntimeError(f"HaMeR 手指精修失败：{_worker_error_message(list(tail), returncode)}")
             finally:
                 if child.poll() is None:
                     child.kill()

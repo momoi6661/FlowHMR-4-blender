@@ -88,6 +88,31 @@ class MotionExportsTest(unittest.TestCase):
             code, _, _, error = self.request("GET", "/api/jobs/group/vmd?person=99")
             self.assertEqual((code, error["error_code"]), (400, "scene_people"))
 
+    def test_blender_interchange_handles_single_scene_mesh_and_incomplete_jobs(self):
+        from tests.test_blender_motion import model
+        with patch.object(server, "model_path", return_value=self.reference), \
+                patch("flowhmr.utils.runtime_blender.load_smplh_data", return_value=model()):
+            code, headers, payload, _ = self.request("GET", "/api/jobs/single/blender-motion?mesh=0")
+            self.assertEqual(code, 200)
+            self.assertIn("single.blender.npz", headers["Content-Disposition"])
+            with np.load(BytesIO(payload), allow_pickle=False) as data:
+                self.assertEqual(data["poses_0"].shape, (3, 52, 3))
+                self.assertNotIn("weights", data)
+            code, _, payload, _ = self.request("GET", "/api/jobs/group/blender-motion")
+            self.assertEqual(code, 200)
+            with np.load(BytesIO(payload), allow_pickle=False) as data:
+                self.assertIn("weights", data)
+                np.testing.assert_equal(data["trans_1"], np.broadcast_to([1.25, 0, 0], (3, 3)))
+            code, _, payload, _ = self.request("GET", "/api/jobs/group/blender-motion?person=2&mesh=0")
+            self.assertEqual(code, 200)
+            with np.load(BytesIO(payload), allow_pickle=False) as data:
+                self.assertEqual(data["poses_0"].shape, (3, 52, 3))
+                self.assertNotIn("poses_1", data)
+                np.testing.assert_equal(data["trans_0"], np.broadcast_to([1.25, 0, 0], (3, 3)))
+            self.assertEqual(self.request("GET", "/api/jobs/group/blender-motion?person=99")[0], 400)
+            server.JOBS["single"]["status"] = "running"
+            self.assertEqual(self.request("GET", "/api/jobs/single/blender-motion")[0], 409)
+
     def test_metahuman_validates_template_and_selection_before_export(self):
         query = "?profile=metahuman&mesh=0"
         base = "/api/jobs/single/fbx" + query
@@ -100,7 +125,7 @@ class MotionExportsTest(unittest.TestCase):
             self.assertEqual((code, error["error_code"]), (400, "metahuman_export_options"))
             code, _, _, error = self.request("POST", base, data={"template": (BytesIO(b"content"), "avatar.pmx")})
             self.assertEqual((code, error["error_code"]), (400, "metahuman_template_required"))
-            with patch.object(server, "METAHUMAN_TEMPLATE_LIMIT", 7):
+            with patch.object(server, "FBX_TEMPLATE_LIMIT", 7):
                 code, _, _, error = self.request("POST", base, data={"template": (BytesIO(b"x" * 8), "body.fbx")})
             self.assertEqual((code, error["error_code"]), (413, "metahuman_template_size"))
 

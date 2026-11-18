@@ -2,7 +2,9 @@ import { Matrix4, Quaternion, Vector3 } from "three";
 import { canWriteVmdBoneName } from "./pmx-vmd.js";
 import { makeHandPairFit } from "./pmx-hand-fit.js";
 import { makePmxNativeIk } from "./pmx-native-ik.js";
-import { makePoseOffsets, normalizePoseOffsets, PMX_BASELINE_VERSION } from "./pose-offsets.js";
+import { flattenJointCorrections, makePoseOffsets, normalizePoseOffsets, PMX_BASELINE_VERSION } from "./pose-offsets.js";
+import { assertRetargetProfile, customJointEdits, measureProportions, normalizeRetargetProfile, targetSkeleton } from "./retarget-profile.js";
+import { appError } from "./i18n.js";
 
 const JOINTS = 52;
 const UP = new Vector3(0, 1, 0);
@@ -15,7 +17,7 @@ const key = (name = "") => name.normalize("NFKC").toLowerCase().replace(/[\s_.:\
 const vector = (data) => new Vector3().fromArray(data);
 const quaternion = (data) => new Quaternion().fromArray(data).normalize();
 
-function mapBones(bones) {
+export function mapBones(bones) {
   const names = new Map();
   // Prefer the PMX bone's actual name over another bone's English alias.
   for (const field of ["name", "nameEn"]) for (const bone of bones) {
@@ -183,7 +185,7 @@ function scaleRotation(result, rotation, ratio) {
   return result.set(rotation.x * scale, rotation.y * scale, rotation.z * scale, Math.cos(angle));
 }
 
-function vmdRoot(bones, map, parents, grants) {
+function vmdRoots(bones, map, parents, grants, nameCounts) {
   const ancestors = (i) => {
     const result = [];
     for (; i >= 0; i = parents[i]) result.push(i);
@@ -191,10 +193,23 @@ function vmdRoot(bones, map, parents, grants) {
   };
   const common = ancestors(map[0]).reverse();
   const paths = Array.from(map).filter((i) => i >= 0).map((i) => new Set(ancestors(i)));
-  // One common movable bone must carry the same placement that the preview
-  // can otherwise put on the mesh object. VMD has no object transform track.
-  return common.find((i) => (bones[i].pmx?.flags & 4) && paths.every((path) => path.has(i)) &&
-    ancestors(parents[i]).every((p) => grants[p] < 0 && !map.includes(p))) ?? -1;
+  // VMD has no object transform track. A usable root carries the full mapped
+  // body, can be keyed by name, and must not have an animated parent.
+  const candidates = common.filter((i) => (bones[i].pmx?.flags & 4) && !bones[i].pmx?.ik &&
+    nameCounts.get(bones[i].name) === 1 && canWriteVmdBoneName(bones[i].name) &&
+    paths.every((path) => path.has(i)) && ancestors(parents[i]).every((p) => grants[p] < 0 && !map.includes(p)));
+  const find = (aliases) => {
+    for (const field of ["name", "nameEn"]) {
+      for (const alias of aliases) {
+        const found = candidates.find((i) => key(bones[i][field] ?? "") === alias);
+        if (found !== undefined) return found;
+      }
+    }
+    return undefined;
+  };
+  const outer = candidates[0] ?? -1;
+  return { outer, automatic: find(["センター", "center", "centre"]) ??
+    find(["全ての親", "すべての親", "全親", "allparent"]) ?? outer };
 }
 
 function footProbes(mesh, bones, map, restPosition, restQuaternion, meshPosition, meshRotation, scale) {
@@ -403,7 +418,7 @@ function contactRuns(motion, part, sourceJoint) {
 /** Prepare a deterministic, actor-local PMX preview for one saved motion.
  * The caller owns clip timing and any external group transform for multiple actors.
  */
-export function createPmxRetarget(mesh, rest, motion, { poseOffsets = null } = {}) {
+export function createPmxRetarget(mesh, rest, motion, { poseOffsets = null, independentIk = false } = {}) {
   const { bones, unitScale: scale } = rest;
   const { frames, joints, quaternions, contacts, floor, soles } = motion;
   if (!Number.isFinite(scale) || scale <= 0 || !bones?.length || mesh.skeleton?.bones.length !== bones.length) {
@@ -423,28 +438,24 @@ export function createPmxRetarget(mesh, rest, motion, { poseOffsets = null } = {
   });
   const grants = new Int32Array(bones.length).fill(-1);
   boneOrder(parents, grants);
-  const map = mapBones(bones);
+  const manual = normalizeRetargetProfile(poseOffsets?.retarget);
+  if (manual) assertRetargetProfile(manual, targetSkeleton({ kind:"pmx", rest }, mesh), "pmx");
+  const stockMap = mapBones(bones);
+  const map = manual ? manual.map : stockMap;
   const needed = [0, 1, 2, 3, 4, 5, 7, 8, 13, 14, 15, 16, 17, 18, 19, 20, 21];
-  if (needed.some((i) => map[i] < 0)) throw new Error("PMX requires standard humanoid torso, arm and leg bones.");
+  if (!manual && needed.some((i) => map[i] < 0)) throw appError("retarget.mapping_required");
 
   const source = Array.from({ length: JOINTS }, (_, i) => new Vector3().fromArray(motion.rest, i * 3));
   const originalRest = bones.map((b) => vector(b.worldPosition));
   const align = new Quaternion().setFromAxisAngle(UP,
-    lateralYaw(source[13], source[14]) - lateralYaw(originalRest[map[13]], originalRest[map[14]]));
+    lateralYaw(source[13], source[14]) - lateralYaw(originalRest[map[13] < 0 ? map[16] : map[13]],
+      originalRest[map[14] < 0 ? map[17] : map[14]]));
   const meshPosition = mesh.position.clone();
   const originalMeshRotation = mesh.quaternion.clone();
   const meshRotation = align.clone().multiply(originalMeshRotation).normalize();
   const originalRotation = bones.map((b) => quaternion(b.worldQuaternion));
   const bindPosition = originalRest.map((p) => p.clone().sub(meshPosition).applyQuaternion(align).add(meshPosition));
   const bindRotation = originalRotation.map((q) => align.clone().multiply(q).normalize());
-  const edits = makePoseOffsets((j) => bindRotation[map[j]], source[16].clone().sub(source[17]).setY(0));
-  // Keep the sliders relative to the PMX fitting pose. Reflect in each model's
-  // bind axes, just as the interactive mirror control does.
-  const shoulderDefaults = { 13: [0, 0, 15], 16: [0, 0, -15] };
-  shoulderDefaults[14] = edits.mirrorRotation(13, 14, shoulderDefaults[13]) ?? [0, 0, -15];
-  shoulderDefaults[17] = edits.mirrorRotation(16, 17, shoulderDefaults[16]) ?? [0, 0, 15];
-  const shoulderAngles = (joint, angles, direction = 1) => shoulderDefaults[joint]
-    ? angles.map((angle, axis) => wrapAngle(angle + direction * shoulderDefaults[joint][axis])) : angles;
   const restLocal = bones.map((b) => quaternion(b.quaternion));
   const invRestLocal = restLocal.map((q) => q.clone().invert());
   const localPosition = bones.map((b) => vector(b.position));
@@ -464,6 +475,7 @@ export function createPmxRetarget(mesh, rest, motion, { poseOffsets = null } = {
   const nameCounts = new Map();
   for (const {name} of bones) nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1);
   for (const shoulder of [map[13], map[14]]) {
+    if (shoulder < 0) continue;
     for (const {index, name, parent, pmx} of bones) {
       if (parent !== shoulder || bodyAncestors.has(index) || bodyAncestors.has(pmx?.grant?.parentIndex) ||
           /^(?:左|右)(?:腕|肩|ひじ|肘|手首)|(?:arm|shoulder|clavicle|elbow|wrist)/.test(key(name)) ||
@@ -499,9 +511,40 @@ export function createPmxRetarget(mesh, rest, motion, { poseOffsets = null } = {
   const worldRotation = bones.map(() => new Quaternion());
   const worldPosition = bones.map(() => new Vector3());
   const skin = mesh.skeleton.bones;
-  const root = vmdRoot(bones, map, parents, grants);
-  const nativeIk = makePmxNativeIk(mesh, bones, parents, bodyAncestors, root, nameCounts);
-  let ikMode;
+  const { outer, automatic } = vmdRoots(bones, map, parents, grants, nameCounts);
+  const root = manual?.root >= 0 ? manual.root : automatic;
+  const chosenIk = manual && new Set(Object.values(manual.ik).filter((i) => i >= 0));
+  const createIk = (root, selected = null, options) =>
+    makePmxNativeIk(mesh, bones, parents, bodyAncestors, root, nameCounts, selected, options);
+  const controllers = (rig) => Object.fromEntries([["leftFoot",7],["rightFoot",8],["leftHand",20],["rightHand",21]]
+    .map(([slot, j]) => [slot, [...rig.moving].find(([, ctl]) => ctl.effector === map[j])?.[0] ?? -1]));
+  // Discover the same stock IK branches even when the root track goes on
+  // Center and the foot controls live beside it under All Parent.
+  let preservedNativeIk = null;
+  if (!manual || manual.root >= 0 && map.every((i, j) => i === stockMap[j])) {
+    const stockIk = createIk(outer, null, {allowDetached:independentIk}), stockControllers = controllers(stockIk);
+    if (!manual || Object.keys(stockControllers).every((slot) => stockControllers[slot] === manual.ik[slot])) {
+      preservedNativeIk = stockIk;
+    }
+  }
+  const customFit = manual && !preservedNativeIk;
+  const nativeIk = preservedNativeIk ?? createIk(manual?.root >= 0 ? root : outer, chosenIk, {
+    allowDetached:manual?.root >= 0,
+    footControllers:customFit ? [manual.ik.leftFoot, manual.ik.rightFoot] : [],
+  });
+  if (chosenIk && [...chosenIk].some((i) => !nativeIk.moving.has(i))) throw appError("retarget.invalid_ik");
+  const edits = makePoseOffsets((j) => bindRotation[map[j]], source[16].clone().sub(source[17]).setY(0),
+    customFit ? { headPitch:0 } : undefined);
+  // Keep the sliders relative to the PMX fitting pose. Reflect in each model's
+  // bind axes, just as the interactive mirror control does.
+  const shoulderDefaults = customFit ? {} : { 13: [0, 0, 15], 16: [0, 0, -15] };
+  if (!customFit) {
+    shoulderDefaults[14] = edits.mirrorRotation(13, 14, shoulderDefaults[13]) ?? [0, 0, -15];
+    shoulderDefaults[17] = edits.mirrorRotation(16, 17, shoulderDefaults[16]) ?? [0, 0, 15];
+  }
+  const shoulderAngles = (joint, angles, direction = 1) => shoulderDefaults[joint]
+    ? angles.map((angle, axis) => wrapAngle(angle + direction * shoulderDefaults[joint][axis])) : angles;
+  let ikMode, tweaks;
   setPoseOffsets(poseOffsets);
   const localInverse = new Quaternion();
 
@@ -515,6 +558,7 @@ export function createPmxRetarget(mesh, rest, motion, { poseOffsets = null } = {
     (Number.isFinite(boundY) && boundY <= footJointY && footJointY - boundY < 0.25 ? boundY : footJointY - 0.015);
   const sourceHipHeight = source[0].y - sourceSole;
   const targetHipHeight = bindPosition[map[0]].y - targetSole;
+  const proportions = manual ? measureProportions(source, bindPosition, manual, targetSole, sourceSole) : null;
   const support = Number.isFinite(floor) && contacts?.length === frames * 4 && probes.flat().some((p) => p.length > 0);
   const rootLiftCache = support ? [false, true].map(() => ({
     raw: new Float64Array(frames).fill(NaN),
@@ -602,6 +646,7 @@ export function createPmxRetarget(mesh, rest, motion, { poseOffsets = null } = {
     targetLegLength += length;
   }
   const rootMotionScale = sourceLegLength > 0 ? targetLegLength / sourceLegLength : 1;
+  const rootTravel = new Vector3(rootMotionScale, customFit ? proportions.heightRatio : rootMotionScale, rootMotionScale);
   const sourceStandingY = Number.isFinite(floor) ? floor + sourceHipHeight : joints[1];
   // Keep each actor's entry point on the shared stage. Scale height changes
   // from the standing pelvis so a clip can start crouching or in midair.
@@ -672,7 +717,7 @@ export function createPmxRetarget(mesh, rest, motion, { poseOffsets = null } = {
   }
 
   function alignRoot(frame) {
-    offset.fromArray(joints, frame * JOINTS * 3).sub(rootAnchor).multiplyScalar(rootMotionScale)
+    offset.fromArray(joints, frame * JOINTS * 3).sub(rootAnchor).multiply(rootTravel)
       .add(rootAnchor).sub(worldPosition[map[0]]);
     offset.y += hipHeightOffset;
   }
@@ -1042,6 +1087,7 @@ export function createPmxRetarget(mesh, rest, motion, { poseOffsets = null } = {
     let changed = false;
     for (const side of [0, 1]) {
       const j = 16 + side, clavicle = map[13 + side], arm = map[j];
+      if (clavicle < 0) continue;
       const restY = bindPosition[arm].y - bindPosition[neck].y;
       const sourceY = shoulderGoal.fromArray(joints, base + j * 3).sub(point.fromArray(joints, base + 12 * 3)).dot(sourceUp);
       const wanted = restY + shoulderScale * (sourceY - (source[j].y - source[12].y));
@@ -1160,7 +1206,7 @@ export function createPmxRetarget(mesh, rest, motion, { poseOffsets = null } = {
   }
 
   function applyJointEdits() {
-    if (!edits.joints.size) return;
+    if (!edits.joints.size && !tweaks.rotation.size && !tweaks.translation.size) return;
     for (const i of order) {
       const parent = parents[i], p = grants[i], q = localRotation[i], append = appendRotation[i];
       if (p >= 0) {
@@ -1173,17 +1219,28 @@ export function createPmxRetarget(mesh, rest, motion, { poseOffsets = null } = {
       }
       const change = edits.joints.get(sourceForBone[i]);
       if (change) q.multiply(change);
+      const rotation = tweaks.rotation.get(sourceForBone[i]);
+      if (rotation) q.multiply(rotation);
       q.normalize();
       const parentRotation = parent < 0 ? meshRotation : worldRotation[parent];
       const parentPosition = parent < 0 ? meshPosition : worldPosition[parent];
       worldRotation[i].multiplyQuaternions(parentRotation, q);
-      worldPosition[i].copy(localPosition[i]).multiplyScalar(scale).applyQuaternion(parentRotation).add(parentPosition);
+      localWithEdit(i, worldPosition[i]).multiplyScalar(scale).applyQuaternion(parentRotation).add(parentPosition);
     }
+  }
+
+  function localWithEdit(i, dest) {
+    dest.copy(localPosition[i]);
+    const shift = tweaks.translation.get(sourceForBone[i]);
+    if (shift) dest.addScaledVector(shift, 1 / scale);
+    return dest;
   }
 
   function writeSkeleton() {
     for (const i of order) {
-      skin[i].position.copy((ikMode && nativeIk.moving.get(i)?.local) || localPosition[i]);
+      const driven = ikMode && nativeIk.moving.get(i)?.local;
+      if (driven) skin[i].position.copy(driven);
+      else localWithEdit(i, skin[i].position);
       skin[i].quaternion.copy(localRotation[i]);
     }
     mesh.quaternion.multiplyQuaternions(edits.rootRotation, meshRotation);
@@ -1238,8 +1295,15 @@ export function createPmxRetarget(mesh, rest, motion, { poseOffsets = null } = {
     const controllerTracks = bones.filter(({ index }) => nativeIk.moving.has(index)).map(({ name }) => name);
     // The native foot and toe controls stay editable. Bake unrelated chains
     // such as hair rather than relying on the receiving solver to replay them.
-    const liveFootTracks = bones.filter(({ index }) => controllerLeg.has(nativeIk.moving.get(index)))
+    const liveFootTracks = bones.filter(({ index }) => controllerLeg.has(nativeIk.moving.get(index)) ||
+      customFit && chosenIk.has(index))
       .map(({ name }) => name);
+    const inheritsPlacement = new Uint8Array(bones.length), detachedControllers = new Set();
+    for (const i of order) {
+      const inherited = i === root || inheritsPlacement[parents[i]];
+      if (!inherited && nativeIk.moving.has(i)) detachedControllers.add(i);
+      inheritsPlacement[i] = inherited || detachedControllers.has(i);
+    }
     const ikNames = bones.filter((b) => b.pmx?.ik && nameCounts.get(b.name) === 1 &&
       canWriteVmdBoneName(b.name)).map((b) => b.name);
     const invParentRotation = (parents[root] < 0 ? originalMeshRotation : originalRotation[parents[root]]).clone().invert();
@@ -1247,6 +1311,29 @@ export function createPmxRetarget(mesh, rest, motion, { poseOffsets = null } = {
     const authored = new Quaternion();
     const placementRotation = new Quaternion();
     const placementOffset = new Vector3();
+    const controllerParentPosition = new Vector3(), controllerInvParent = new Quaternion();
+    const meshWorldInverse = new Quaternion(), inverseMeshBind = originalMeshRotation.clone().invert();
+    function sampleDetachedController(i, out, at) {
+      const joint = skin[i], parent = joint.parent;
+      // Remove the preview mesh transform from the controller's parent:
+      // on the VMD rig this sibling of the body root was not moved.
+      mesh.worldToLocal(parent.getWorldPosition(controllerParentPosition)).multiplyScalar(scale)
+        .applyQuaternion(originalMeshRotation).add(meshPosition);
+      controllerInvParent.copy(parent.getWorldQuaternion(authored)).invert()
+        .multiply(mesh.getWorldQuaternion(meshWorldInverse)).multiply(inverseMeshBind);
+      meshWorldInverse.invert();
+      // Key the achieved IK target in its actual parent axes, with the
+      // same preview and scene placement as the body. Toe IK descendants
+      // inherit this transform; they just keep their local tracks.
+      mesh.worldToLocal(joint.getWorldPosition(point)).multiplyScalar(scale)
+        .applyQuaternion(mesh.quaternion).add(mesh.position)
+        .applyQuaternion(placementRotation).add(placementOffset)
+        .sub(controllerParentPosition).applyQuaternion(controllerInvParent)
+        .divideScalar(scale).sub(localPosition[i]).toArray(out, at);
+      joint.getWorldQuaternion(authored);
+      authored.premultiply(meshWorldInverse).premultiply(mesh.quaternion)
+        .premultiply(placementRotation).premultiply(controllerInvParent);
+    }
     vmd = { get tracks() { return ikMode ? ikTracks : fkTracks; }, ikNames,
       get ikEnabledNames() { return ikMode ? liveFootTracks : []; },
       get controllerTracks() { return ikMode ? controllerTracks : []; }, rootBoneIndex: root, sample(frame, qs, ts, placement) {
@@ -1273,9 +1360,14 @@ export function createPmxRetarget(mesh, rest, motion, { poseOffsets = null } = {
             .sub(parentPosition).applyQuaternion(invParentRotation)
             .divideScalar(scale).sub(localPosition[i]).toArray(ts, j * 3);
           authored.copy(invParentRotation).multiply(placementRotation).multiply(edits.rootRotation).multiply(worldRotation[i]);
+        } else if (ikMode && detachedControllers.has(i)) {
+          sampleDetachedController(i, ts, j * 3);
         } else {
           const target = ikMode && nativeIk.moving.get(i);
           if (target) point.copy(target.local).sub(localPosition[i]).toArray(ts, j * 3);
+          else if (tweaks.translation.has(sourceForBone[i])) {
+            point.copy(tweaks.translation.get(sourceForBone[i])).divideScalar(scale).toArray(ts, j * 3);
+          }
           authored.copy(ikMode ? skin[i].quaternion : localRotation[i]);
         }
         // A PMX player applies append inheritance when it evaluates the rig.
@@ -1287,6 +1379,18 @@ export function createPmxRetarget(mesh, rest, motion, { poseOffsets = null } = {
     } };
   }
 
+  function relativeRotations(input) {
+    const rotations = { ...input };
+    for (const joint of Object.keys(shoulderDefaults)) rotations[joint] = shoulderAngles(joint, rotations[joint] ?? ZERO_ANGLES);
+    return rotations;
+  }
+  function editableCorrections(settings) {
+    if (!Object.keys(settings.rotations).length) return settings.retarget ?? settings.boneOffsets;
+    const neutral = makePoseOffsets((j) => bindRotation[map[j]], source[16].clone().sub(source[17]).setY(0),
+      customFit ? { headPitch:0 } : undefined);
+    neutral.set({ rotations:relativeRotations({}) });
+    return flattenJointCorrections(edits.joints, neutral.joints, settings.retarget ?? settings.boneOffsets);
+  }
   function setPoseOffsets(settings) {
     const pose = normalizePoseOffsets(settings);
     pose.ikMode = nativeIk.available && settings?.ikMode !== "fk" ? "ik" : "fk";
@@ -1302,11 +1406,9 @@ export function createPmxRetarget(mesh, rest, motion, { poseOffsets = null } = {
       }
     }
     pose.pmxBaselineVersion = PMX_BASELINE_VERSION;
-    const rotations = { ...pose.rotations };
-    for (const joint of Object.keys(shoulderDefaults)) {
-      rotations[joint] = shoulderAngles(joint, rotations[joint] ?? ZERO_ANGLES);
-    }
+    const rotations = relativeRotations(pose.rotations);
     edits.set({ ...pose, rotations });
+    tweaks = customJointEdits(manual ? pose.retarget ?? manual : pose.boneOffsets, (j) => !!(bones[map[j]]?.pmx.flags & 4));
     ikMode = pose.ikMode === "ik";
     return pose;
   }
@@ -1314,7 +1416,8 @@ export function createPmxRetarget(mesh, rest, motion, { poseOffsets = null } = {
     const mirrored = edits.mirrorRotation(from, to, shoulderAngles(from, angles));
     return mirrored && shoulderAngles(to, mirrored, -1).map((angle) => Number(angle.toFixed(2)));
   }
-  return { apply, vmd, setPoseOffsets, nativeIkAvailable: nativeIk.available, mirrorRotation, matched: map.filter((i) => i >= 0).length,
-    sourceToTarget: Array.from(map), skippedGrants, support, rootMotionScale };
+  const nativeControllers = controllers(nativeIk);
+  return { apply, vmd, setPoseOffsets, editableCorrections, nativeIkAvailable: nativeIk.available, nativeControllers, mirrorRotation, matched: map.filter((i) => i >= 0).length,
+    sourceToTarget: Array.from(map), skippedGrants, support, rootMotionScale, proportions };
 }
 

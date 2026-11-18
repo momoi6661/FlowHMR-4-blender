@@ -339,7 +339,7 @@ function rigBones(mesh) {
   return result;
 }
 
-function retainScene(scene, meshes) {
+function retainScene(scene, meshes, extraBones) {
   const keep = new Set([scene]);
   const retain = (node) => {
     for (let current = node; current && !keep.has(current); current = current.parent) keep.add(current);
@@ -348,6 +348,7 @@ function retainScene(scene, meshes) {
     retain(mesh);
     if (isUsableSkin(mesh)) for (const bone of mesh.skeleton.bones) retain(bone);
   }
+  for (const bone of extraBones) retain(bone);
   const prune = (node) => {
     node.animations = [];
     for (const child of [...node.children]) {
@@ -369,7 +370,18 @@ function normalization(scene, main) {
   scene.updateMatrixWorld(true);
   const lengths = main.bones.filter((bone) => /^(head|hips|pelvis|leftfoot|rightfoot|foot[lr]|lefttoe?base|righttoe?base|ball[lr])$/.test(boneKey(bone)))
     .map((bone) => bone.getWorldPosition(new Vector3()).dot(sourceUp));
-  const skeletalHeight = Math.max(...lengths) - Math.min(...lengths);
+  let skeletalHeight = Math.max(...lengths) - Math.min(...lengths);
+  if (!(skeletalHeight > 0)) {
+    // A custom rig can use arbitrary names. Use its weighted skeleton for
+    // the unit fallback, not the mesh's hats, hair, or props.
+    let low = Infinity, high = -Infinity;
+    const point = new Vector3();
+    for (const bone of main.mesh.skeleton.bones) {
+      const h = bone.getWorldPosition(point).dot(sourceUp);
+      low = Math.min(h, low); high = Math.max(h, high);
+    }
+    skeletalHeight = high - low;
+  }
   const cmPerUnit = global.UnitScaleFactor;
   // Older files may omit GlobalSettings. In that case use their measured
   // humanoid skeleton to distinguish conventional metres from centimetres.
@@ -421,13 +433,14 @@ function cloneActor(source, primary, others) {
   });
   return {
     root,
-    rig: { ...bindRig(primary), additionalRigs: others.map(bindRig) },
+    rig: { ...bindRig(primary), manualBones: primary.manualBones.map((bone) => copies.get(bone)),
+      additionalRigs: others.map(bindRig) },
     skeletons: [...skeletons.values()],
   };
 }
 
 /**
- * Load a local Mixamo or MetaHuman-style skinned FBX. The returned template
+ * Load a local skinned FBX. The returned template
  * keeps the FBX bind pose. Clones own their bones and skeletons, and share the
  * asset's original geometry, materials and textures.
  */
@@ -499,6 +512,9 @@ export async function loadFbxCharacter(files, selectedFile, { signal, textureUrl
 
     const sceneMeshes = [];
     scene.traverse((node) => {
+      // Keep a path of authored FBX model nodes across Object3D cloning.
+      // Synthetic normalization groups have no FBX node ID.
+      if (Number.isSafeInteger(node.ID)) node.userData.fbxModel = true;
       if (!node.isMesh || !node.geometry) return;
       geometries.add(node.geometry);
       delete node.geometry.FBX_Deformer;
@@ -516,10 +532,10 @@ export async function loadFbxCharacter(files, selectedFile, { signal, textureUrl
       const profile = matchingProfile(bones);
       return { mesh, bones, profile, role: meshRole(mesh, bones, profile) };
     });
-    const main = rigList.filter((rig) => rig.profile && rig.role !== "face").sort((a, b) =>
-      b.bones.length - a.bones.length || b.mesh.geometry.getAttribute("position").count - a.mesh.geometry.getAttribute("position").count,
-    )[0];
-    if (!main) throw new FbxCharacterError("unsupported_rig", "No recognizable Mixamo or MetaHuman body skeleton was found.");
+    const candidates = rigList.filter((rig) => rig.role !== "face");
+    const main = (candidates.length ? candidates : rigList).sort((a, b) =>
+      Number(!!b.profile) - Number(!!a.profile) || b.bones.length - a.bones.length ||
+      b.mesh.geometry.getAttribute("position").count - a.mesh.geometry.getAttribute("position").count)[0];
     const known = new Set(main.bones);
     const additional = rigList.filter((rig) => {
       if (rig === main || rig.bones.every((bone) => known.has(bone))) return false;
@@ -527,7 +543,10 @@ export async function loadFbxCharacter(files, selectedFile, { signal, textureUrl
       return true;
     });
 
-    retainScene(scene, visibleMeshes.filter((mesh) => !mesh.isSkinnedMesh || isUsableSkin(mesh)));
+    const bones = new Set(main.bones);
+    scene.traverse((node) => { if (node.isBone) bones.add(node); });
+    main.manualBones = [...bones];
+    retainScene(scene, visibleMeshes.filter((mesh) => !mesh.isSkinnedMesh || isUsableSkin(mesh)), main.manualBones);
     const norm = normalization(scene, main);
     const axisRoot = new Group();
     axisRoot.quaternion.copy(norm.rotation);
@@ -566,7 +585,7 @@ export async function loadFbxCharacter(files, selectedFile, { signal, textureUrl
     };
     return {
       kind: "fbx",
-      profile: main.profile,
+      profile: main.profile ?? "custom",
       name,
       path: entry.path,
       rest: main.rest,

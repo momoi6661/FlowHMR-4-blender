@@ -1,14 +1,19 @@
 import { $ } from "./utils.js";
 import { appError, message as m, setAttr, setText, t } from "./i18n.js";
+import { secondsToFrames } from "./clip-range.js";
 
 // The trim lane is in source frames. The playback lane is in generated motion frames.
 export function initTrim({ video, clock, seek }) {
   const start = $("trimStart"), end = $("trimEnd");
   const startValue = $("trimStartValue"), endValue = $("trimEndValue");
   const full = $("trimFull"), lane = $("trimRange");
+  const clipStart = $("clipStart"), clipEnd = $("clipEnd");
+  const startHere = $("clipStartHere"), endHere = $("clipEndHere"), clipFull = $("clipFull");
   let active = false, editable = true, frames = 0, exact = false;
+  let invalidSeconds = false;
+  const secondsText = (frame) => String(Number((frame / 30).toFixed(9)));
 
-  function sync() {
+  function sync(preserveSeconds = false) {
     const first = startValue.valueAsNumber || 1;
     const last = endValue.valueAsNumber || frames || first;
     const max = Math.max(1, frames), denominator = Math.max(1, max - 1);
@@ -19,7 +24,18 @@ export function initTrim({ video, clock, seek }) {
     lane.style.setProperty("--trim-rest", (max - Number(end.value)) / denominator);
     start.disabled = end.disabled = !active || !editable || frames < 2;
     startValue.disabled = endValue.disabled = full.disabled = !active || !editable;
+    clipStart.disabled = clipEnd.disabled = clipFull.disabled = !active || !editable;
+    startHere.disabled = endHere.disabled = !active || !editable || !clock.ready;
     const hasEnd = !!endValue.value;
+    if (!preserveSeconds) {
+      clipStart.value = secondsText(first - 1);
+      clipEnd.value = hasEnd ? secondsText(last) : "";
+      invalidSeconds = false;
+      clipStart.setCustomValidity("");
+      clipEnd.setCustomValidity("");
+    }
+    setText($("clipSummary"), () => !active ? t("clip.choose_first") : invalidSeconds ? t("clip.invalid")
+      : t("clip.summary", { start: secondsText(first - 1), end: hasEnd ? secondsText(last) : t("clip.to_end") }));
     setAttr(start, "aria-valuetext", m("timeline.frame", { frame: first }));
     setAttr(end, "aria-valuetext", hasEnd ? m("timeline.frame", { frame: last }) : m("timeline.auto_end"));
     setText($("rangeSummary"), () => [
@@ -52,17 +68,47 @@ export function initTrim({ video, clock, seek }) {
     seek(last - 1);
   });
   for (const field of [startValue, endValue]) {
-    field.addEventListener("input", sync);
+    field.addEventListener("input", () => sync());
     field.addEventListener("change", () => {
       const frame = field.valueAsNumber;
       if (Number.isSafeInteger(frame) && frame >= 1 && (!frames || frame <= frames)) seek(frame - 1);
     });
   }
+  function applySeconds() {
+    const endSeconds = clipEnd.value === "" && !clipEnd.validity.badInput ? null : clipEnd.valueAsNumber;
+    const range = secondsToFrames(clipStart.valueAsNumber, endSeconds);
+    invalidSeconds = range === null;
+    clipStart.setCustomValidity(invalidSeconds ? t("clip.invalid") : "");
+    clipEnd.setCustomValidity(invalidSeconds ? t("clip.invalid") : "");
+    if (range) {
+      startValue.value = range.start_frame + 1;
+      endValue.value = range.end_frame === null ? "" : range.end_frame + 1;
+    }
+    sync(true);
+    return range;
+  }
+  for (const field of [clipStart, clipEnd]) {
+    field.addEventListener("input", applySeconds);
+    field.addEventListener("change", () => {
+      const range = applySeconds();
+      if (range) seek(field === clipStart ? range.start_frame : range.end_frame ?? frames - 1);
+    });
+  }
+  startHere.onclick = () => {
+    clipStart.value = secondsText(Math.max(0, clock.frameAt(video.currentTime)));
+    applySeconds();
+  };
+  endHere.onclick = () => {
+    clipEnd.value = secondsText(Math.max(1, clock.frameAt(video.currentTime) + 1));
+    applySeconds();
+  };
+  video.addEventListener("flowhmr:clockready", () => sync(true));
   full.onclick = () => { startValue.value = 1; endValue.value = ""; sync(); };
+  clipFull.onclick = () => full.onclick();
   sync();
 
   return {
-    begin() { active = editable = true; frames = 0; exact = false; sync(); },
+    begin() { active = editable = true; frames = 0; exact = false; full.onclick(); },
     clear() { active = false; editable = true; frames = 0; exact = false; full.onclick(); },
     setEditable(value) { if (editable !== value) { editable = value; sync(); } },
     setSource(count) {
@@ -76,6 +122,7 @@ export function initTrim({ video, clock, seek }) {
       sync();
     },
     read() {
+      if (invalidSeconds) throw appError("clip.invalid");
       const first = startValue.valueAsNumber, last = endValue.value === "" && !endValue.validity.badInput ? null : endValue.valueAsNumber;
       if (!Number.isSafeInteger(first) || first < 1 || (last !== null && (!Number.isSafeInteger(last) || last < first))) {
         throw appError("timeline.invalid");

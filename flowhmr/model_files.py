@@ -10,6 +10,10 @@ MODEL_ROOT = PROJECT_ROOT / "models"
 HAMER_RUNTIME = PROJECT_ROOT / "third_party/hamer_inference"
 FLOWHMR_CKPT = "flowhmr_latest/flowhmr_latest.ckpt"
 FLOWHMR_CONFIG = "flowhmr_latest/config.yml"
+# Optional base checkpoint used by the torso-motion optimization.
+FLOWHMR_BASE_CKPT = "flowhmr_base/flowhmr_base.ckpt"
+FLOWHMR_BASE_CONFIG = "flowhmr_base/config.yml"
+FLOWHMR_BASE_FILES = (FLOWHMR_BASE_CKPT, FLOWHMR_BASE_CONFIG)
 YOLOX = "yolox/yolox_l.pth"
 SAM3D_FILES = (
     "sam-3d-body-dinov3/model.ckpt",
@@ -28,7 +32,7 @@ SMPLH_FILES = {
 SMPLH_REFERENCE_ORDER = ("neutral", "male", "female")
 JOINT_REGRESSOR = "body_models/smpl_neutral_J_regressor.pt"
 HAMER_FILES = ("hamer/hamer.ckpt", "hamer/model_config.yaml", "hamer/mano_mean_params.npz")
-MODEL_DESTINATIONS = (FLOWHMR_CKPT, FLOWHMR_CONFIG, YOLOX, *SAM3D_FILES, VGGT,
+MODEL_DESTINATIONS = (FLOWHMR_CKPT, FLOWHMR_CONFIG, *FLOWHMR_BASE_FILES, YOLOX, *SAM3D_FILES, VGGT,
                       *SMPLH_FILES.values(), JOINT_REGRESSOR, *MANO_FILES, *HAMER_FILES)
 
 
@@ -107,6 +111,15 @@ def flowhmr_paths(ckpt=None, config=None):
     checkpoint = Path(ckpt).absolute() if ckpt else resolve_model(FLOWHMR_CKPT)
     config = Path(config).absolute() if config else checkpoint.with_name("config.yml")
     return checkpoint, config
+
+
+def flowhmr_base_paths():
+    """Optional base checkpoint and config used by the torso-motion optimization."""
+    return resolve_model(FLOWHMR_BASE_CKPT), resolve_model(FLOWHMR_BASE_CONFIG)
+
+
+def torso_optimization_available():
+    return all(file_present(resolve_model(relative)) for relative in FLOWHMR_BASE_FILES)
 
 
 def core_model_paths(ckpt=None, config=None, *, body_reference=None):

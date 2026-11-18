@@ -2,7 +2,8 @@ import { Euler, Quaternion, Vector3 } from "three";
 import { canWriteVmdBoneName } from "./pmx-vmd.js";
 
 /** Use the IK chains and right-handed angle limits read from the PMX. */
-export function makePmxNativeIk(mesh, bones, parents, bodyAncestors, root, nameCounts) {
+export function makePmxNativeIk(mesh, bones, parents, bodyAncestors, root, nameCounts, chosen = null,
+  { allowDetached = false, footControllers = [] } = {}) {
   const skin = mesh.skeleton.bones;
   const ancestorOf = (a, b) => {
     for (let i = b; i >= 0; i = parents[i]) if (i === a) return true;
@@ -10,6 +11,7 @@ export function makePmxNativeIk(mesh, bones, parents, bodyAncestors, root, nameC
   };
   const writable = (i) => nameCounts.get(bones[i]?.name) === 1 && canWriteVmdBoneName(bones[i].name);
   const definitions = mesh.geometry?.userData?.MMD?.iks ?? [];
+  const selectedFeet = definitions.filter(({target}) => footControllers.includes(target));
   const chains = [];
   const moving = new Map(), baked = new Set();
   for (const { target, effector, links, iteration, maxAngle } of definitions) {
@@ -17,11 +19,18 @@ export function makePmxNativeIk(mesh, bones, parents, bodyAncestors, root, nameC
     if (links.some(({ index }) => !skin[index] || !writable(index) || index === effector ||
       !ancestorOf(index, effector) || ancestorOf(index, target))) continue;
     const tracked = links.some(({ index }) => bodyAncestors.has(index));
+    // A manually selected foot controller also needs its native toe IK.
+    // Only include a separate chain that follows that controller and ankle.
+    const followsFoot = chosen && tracked && !chosen.has(target) && selectedFeet.some((ankle) =>
+      target !== ankle.target && effector !== ankle.effector &&
+      ancestorOf(ankle.target, target) && ancestorOf(ankle.effector, effector) &&
+      links.some(({index}) => index === ankle.effector));
+    if (chosen && tracked && !chosen.has(target) && !followsFoot) continue;
     if (tracked) {
-      // A motion-driven chain must have a movable controller under the
-      // same root as the character so VMD preserves its placement.
+      // Native profiles keep the old common-root check. An explicitly
+      // bound body root may leave an IK branch to be placed separately.
       if (!(bones[target].pmx.flags & 4) || bodyAncestors.has(target) ||
-          (root >= 0 && !ancestorOf(root, target))) continue;
+          (!allowDetached && root >= 0 && !ancestorOf(root, target))) continue;
       moving.set(target, { effector, goal: new Vector3(), local: new Vector3() });
     }
     for (const { index } of links) baked.add(index);
@@ -43,10 +52,11 @@ export function makePmxNativeIk(mesh, bones, parents, bodyAncestors, root, nameC
     joint.quaternion.setFromEuler(euler.set(limits.x, limits.y, limits.z));
     return true;
   }
-  function solve() {
+  function solve(onlyController = null) {
     if (!chains.length) return;
     mesh.updateWorldMatrix(true, true);
     for (const chain of chains) {
+      if (onlyController !== null && chain.target !== onlyController) continue;
       const tip = skin[chain.effector];
       // A target can already coincide with its effector while the seed knee
       // still violates the PMX hinge. Resolve that before the distance check.

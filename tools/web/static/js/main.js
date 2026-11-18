@@ -14,9 +14,14 @@ import { initTrim } from "./trim.js";
 import { initModelDialog } from "./models.js";
 import { initRuntimeDialog } from "./runtime.js";
 import { initMotionExport } from "./motion-export.js";
+import { initPosePresets } from "./pose-presets.js";
 import { initUpdates } from "./update.js";
+import { isImageFile, isImageJob } from "./image-media.js";
+import { initMcpDialog } from "./mcp.js";
+import { initUIEvents } from './ui-events.js';
 
 setupLocalization();
+initMcpDialog();
 const confirmWorkspaceReady = initUpdates();
 const themeOptions = $("themeOptions");
 const themeButtons = [...themeOptions.querySelectorAll("[data-theme-choice]")];
@@ -48,13 +53,14 @@ const bus = createBus();
 initLayout();
 let info = null;
 let currentJob = null;
-let pollTimer = null;
 let loadedResult = null;
 let paramsShownFor = null;
 let restoreParameterDraft = false;
 let submitting = false;
+let releasingGpu = false, currentJobActive = false, modelsLoadedState = false;
 let pollVersion = 0;
-let historyStamp = "";
+let currentRevision = null;
+let knownJobs = null;
 const ACTIVE = new Set(["queued", "running", "waiting_user", "cancel_requested"]);
 
 const upload = initUpload(bus);
@@ -70,17 +76,40 @@ const progress = initProgress();
 const person = initPersonSelect(bus);
 const preview = initPreview(bus);
 const viewer = initViewer(preview);
+const posePresets = initPosePresets(viewer, openJob);
+window.addEventListener('flowhmr:server-update', event => {
+  if (event.detail.kind === 'viewer_command') {
+    const { request_id: token, command } = event.detail.data;
+    void (async () => {
+      const base = `/api/ui/viewer-command/${token}`;
+      const claim = await fetch(`${base}/claim`, { method: 'POST' });
+      if (!claim.ok) return;
+      const result = viewer.controlPlayback(command);
+      await fetch(`${base}/reply`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(result),
+      });
+    })();
+    return;
+  }
+  if (event.detail.kind !== 'snapshot_request') return;
+  const token = event.detail.data.request_id;
+  void fetch(`/api/ui/viewer-snapshot/${token}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(viewer.snapshot()),
+  });
+});
 const motionExport = initMotionExport(() => viewer.bodyVariant, viewer);
 const trim = initTrim({ ...preview, seek: viewer.seekSourceFrame });
-const history = initHistory({ onOpen: openJob, onRerun: rerun, onDeleted: clearDeletedJobs });
+const history = initHistory({ onOpen: (id) => openJob(id, { focus: true }), onRerun: rerun, onDeleted: clearDeletedJobs, onUpdated: syncExternalJobs });
 const runtime = initRuntimeDialog();
 let params = null;
 
 function renderModelStatus(loaded, loading = false) {
+  modelsLoadedState = !!loaded;
   const missing = info?.model_files?.items.some((item) => item.blocking);
   $("btnModels").classList.toggle("needs-models", !!missing);
   setText($("modelInfo"), !info ? m("connection.offline") : missing ? m("models.required_missing")
-    : loading ? m("models.loading") : loaded ? info.device : m("models.deferred"));
+    : loading ? m("models.loading") : loaded ? m("gpu.loaded_device", { device: info.device }) : m("models.deferred"));
+  $("btnReleaseGpu").disabled = !info || !loaded || loading || submitting || releasingGpu || currentJobActive;
 }
 
 function applyModelInfo(next) {
@@ -92,6 +121,12 @@ function applyModelInfo(next) {
   $("optHamer").disabled = !hamerReady;
   setText($("hamerHint"), m(hamerReady ? "hamer.hint" : "hamer.missing_hint"));
   params?.refreshHamer();
+  const torsoReady = !!info?.torso_available;
+  $("optTorso").disabled = !torsoReady;
+  setText($("torsoHint"), m(torsoReady ? "torso.hint" : "torso.missing"));
+  params?.refreshTorso();
+  params?.setHybridAvailable(!!info?.sam_hybrid_available);
+  params?.setCameraOnCpuForAmdIgpu(!!info?.camera_on_cpu_for_amd_igpu);
   if (variantsChanged) viewer.setBodyVariants(info?.body_variants, info?.body_reference);
 }
 
@@ -113,7 +148,8 @@ if (info?.postprocess_available === false) {
   $("optPostprocess").disabled = true;
   setText($("postprocessHint"), m("correction.unavailable"));
 }
-params = initParams(info?.defaults ?? {}, info?.sam_manual_default ?? 24);
+params = initParams(info?.defaults ?? {}, info?.sam_manual_default ?? 24,
+  !!info?.sam_hybrid_available, !!info?.camera_on_cpu_for_amd_igpu);
 if (info?.runtime?.supported) runtime.restore();
 const jobs = (await history.refresh()) ?? [];
 const savedJob = localStorage.getItem("flowhmr-last-job");
@@ -124,9 +160,10 @@ if (!initialJob && savedJob) {
   try { initialJob = await api.getJob(savedJob); } catch { /* job may have been deleted */ }
 }
 initialJob ??= jobs.find((job) => job.status === "done") ?? jobs[0];
-if (initialJob) void openJob(initialJob.id, true);
+if (initialJob) void openJob(initialJob.id, { restoreDraft: true });
 syncSubmit();
 if (info) confirmWorkspaceReady();
+initUIEvents();
 
 // ------------------------------------------------------------------ wiring
 bus.on("file:selected", (file) => {
@@ -137,19 +174,35 @@ bus.on("file:selected", (file) => {
     viewer.setStatus(m("view.new_video"));
   }
   params.newSource();
-  trim.begin();
+  if (isImageFile(file)) trim.clear(); else trim.begin();
+  show("sourceClip", !isImageFile(file));
   preview.showLocal(file);
+  viewer.setSourceKind(isImageFile(file));
   syncSubmit();
 });
 bus.on("file:cleared", () => {
-  if (!currentJob) { trim.clear(); preview.clear(); }
+  if (!currentJob) { trim.clear(); preview.clear(); viewer.setSourceKind(false); }
   syncSubmit();
 });
 bus.on("preview:pick", (i) => person.select(i));
 bus.on("person:confirmed", () => poll());
-bus.on("person:reselect", () => rerunCurrent({ manual_select: true, reselect_person: true }));
+bus.on("person:reselect", () => rerunCurrent({ manual_select: true, select_single_person: true, reselect_person: true }));
 
 $("btnSubmit").addEventListener("click", submit);
+$("btnReleaseGpu").addEventListener("click", async () => {
+  releasingGpu = true;
+  $("btnReleaseGpu").disabled = true;
+  setText($("gpuMessage"), m("gpu.releasing"));
+  try {
+    await api.releaseGpu();
+    applyModelInfo(await api.getInfo());
+    setText($("gpuMessage"), m("gpu.released"));
+  } catch (error) { setText($("gpuMessage"), error); }
+  finally {
+    releasingGpu = false;
+    renderModelStatus(info?.models_loaded);
+  }
+});
 $("btnDefaults").addEventListener("click", () => params.reset());
 $("btnAlignScene").addEventListener("click", async () => {
   const id = currentJob;
@@ -188,7 +241,10 @@ function syncSubmit() {
   const needsRuntime = info?.runtime?.supported && !info.runtime.ready;
   show(btn, !currentJob || !!upload.getFile());
   btn.disabled = submitting || (!needsRuntime && !upload.getFile());
-  setText(btn, m(submitting ? "job.submitting" : needsRuntime ? "runtime.setup" : "settings.generate"));
+  setText(btn, m(submitting ? "job.submitting" : needsRuntime ? "runtime.setup"
+    : isImageFile(upload.getFile()) ? "image.generate" : "settings.generate"));
+  upload.setBusy(submitting);
+  $("btnReleaseGpu").disabled = !info || !modelsLoadedState || submitting || releasingGpu || currentJobActive;
   $("btnRerun").disabled = $("btnSafeRerun").disabled = $("personReselect").disabled = submitting;
 }
 
@@ -197,12 +253,16 @@ async function submit() {
   const file = upload.getFile();
   if (!file) return;
   let p;
-  try { p = { ...params.read(), ...trim.read() }; } catch (e) { upload.setError(e); return; }
+  try { p = { ...params.read(), source_kind: isImageFile(file) ? "image" : "video", source_name: file.name,
+    ...(isImageFile(file) ? { auto_frames: true, start_frame: 0, end_frame: 0, static_camera: true } : trim.read()) }; }
+  catch (e) { upload.setError(e); return; }
   submitting = true;
   syncSubmit();
   resetJobView();
   try {
-    const id = await api.uploadVideo(file, p, (frac) => progress.showUploading(file.name, frac));
+    if (isImageFile(file)) progress.showUploading(file.name, 0);
+    const prepared = await upload.prepare(file);
+    const id = await api.uploadVideo(prepared, p, (frac) => progress.showUploading(file.name, frac));
     upload.clear();
     await openJob(id);
   } catch (e) {
@@ -221,7 +281,7 @@ async function rerun(jobId, overrides = {}) {
   syncSubmit();
   try {
     const id = await api.rerunJob(jobId, p);
-    await openJob(id);
+    await openJob(id, { focus: true });
   } finally {
     submitting = false;
     syncSubmit();
@@ -229,12 +289,13 @@ async function rerun(jobId, overrides = {}) {
 }
 
 function resetJobView() {
+  posePresets.clear();
   motionExport.clear();
-  clearTimeout(pollTimer);
   pollVersion++;
   currentJob = null;
-  historyStamp = "";
+  currentJobActive = false;
   loadedResult = null;
+  currentRevision = null;
   person.reset();
   preview.setTrack(null);
   viewer.clear();
@@ -258,21 +319,42 @@ function clearDeletedJobs(ids) {
 }
 
 // ------------------------------------------------------------------ job polling
-async function openJob(id, restoreDraft = false) {
+function revision(job) {
+  return JSON.stringify([job.id, job.status, job.progress, job.params, job.selected_person ?? null,
+    job.person_count ?? null, job.message ?? null, job.loading_models ?? null, job.scene_state ?? null,
+    job.source_frames ?? null, job.stages ?? null, job.sam_batch ?? null, job.camera ?? null]);
+}
+
+function syncExternalJobs(jobs, polling) {
+  const incoming = knownJobs && jobs.find((job) => job.source === 'mcp' && !knownJobs.has(job.id));
+  if (!knownJobs) knownJobs = new Set();
+  for (const job of jobs) knownJobs.add(job.id);
+  if (submitting || upload.getFile()) return;
+  if (incoming) {
+    void openJob(incoming.id);
+    return;
+  }
+  const selected = jobs.find((job) => job.id === currentJob);
+  if (selected && (revision(selected) !== currentRevision || (polling && ACTIVE.has(selected.status)))) void poll();
+}
+
+async function openJob(id, { restoreDraft = false, focus = false } = {}) {
   if (upload.getFile()) upload.clear();
   resetJobView();
   currentJob = id;
-  restoreParameterDraft = restoreDraft === true;
+  restoreParameterDraft = restoreDraft;
   trim.begin();
   paramsShownFor = null;
   localStorage.setItem("flowhmr-last-job", id);
   history.setCurrent(id);
+  // The clicked history row keeps keyboard focus, so Space would re-open it instead
+  // of playing. Move the shortcut scope to the 3D viewport.
+  if (focus) viewer.focus();
   syncSubmit();
   await poll();
 }
 
 async function poll() {
-  clearTimeout(pollTimer);
   const id = currentJob;
   if (!id) return;
   const version = ++pollVersion;
@@ -281,12 +363,14 @@ async function poll() {
     job = await api.getJob(id);
   } catch (e) {
     if (version === pollVersion) {
+      currentRevision = null;
       setText($("modelInfo"), m("connection.reconnecting"));
-      pollTimer = setTimeout(poll, 2000);
     }
     return;
   }
   if (version !== pollVersion) return;
+  currentJobActive = ACTIVE.has(job.status);
+  currentRevision = revision(job);
   renderModelStatus(job.models_loaded ?? info?.models_loaded ?? true, job.status === "running" && job.loading_models);
 
   progress.render(job);
@@ -300,21 +384,18 @@ async function poll() {
     : job.scene_state === "running" ? "job.scene_aligning"
     : job.loading_models ? "job.model_loading"
     : "job.generating"));
-  preview.showJob(api.videoUrl(id, job.has_preview_video), () => jobLabel(job));
+  viewer.setSourceKind(isImageJob(job));
+  preview.showJob(api.videoUrl(id, job.has_preview_video), () => jobLabel(job), isImageJob(job));
   person.update(job);
   trim.setSource(job.source_frames);
   trim.setEditable(!ACTIVE.has(job.status));
+  show("sourceClip", !isImageJob(job));
   if (paramsShownFor !== id) {
     params.openJob(id, job.params, job.correction, restoreParameterDraft);
     trim.apply(job.params);
     paramsShownFor = id;
   }
-  const stamp = `${id}:${job.status}:${Math.floor(job.progress / 5)}`;
-  if (stamp !== historyStamp) { historyStamp = stamp; void history.refresh(); }
-
-  if (ACTIVE.has(job.status)) {
-    pollTimer = setTimeout(poll, job.status === "waiting_user" ? 1500 : 1000);
-  } else if (job.status === "done" && loadedResult !== id) {
+  if (job.status === "done" && loadedResult !== id) {
     loadedResult = id;
     params.suggestCorrectionHeight(job.correction);
     motionExport.setResult(id, job);
@@ -323,6 +404,7 @@ async function poll() {
     show("dlNpz", true);
     try {
       const meta = await viewer.load(id, job.scene);
+      if (meta && id === currentJob) posePresets.setReady();
       if (meta && id === currentJob) void loadTracks(id, job.scene);
     } catch (e) {
       if (id === currentJob) {

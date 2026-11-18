@@ -135,6 +135,22 @@ def digest(path) -> str:
     return result
 
 
+def unverified_torch_weights(paths):
+    """For legacy PyTorch, only load weight files pinned to known hashes."""
+    unverified = []
+    for path in map(Path, paths):
+        if path.suffix.lower() not in (".pt", ".pth", ".ckpt"):
+            continue
+        asset = pinned_asset(relative_name(path))
+        try:
+            valid = asset is not None and asset.sha256 is not None and digest(path) == asset.sha256
+        except OSError:
+            valid = False
+        if not valid:
+            unverified.append(asset.relative if asset else path.name)
+    return unverified
+
+
 def verify(deep: bool = False, *, required_paths=None) -> list[Verdict]:
     """Check active required models and any installed optional model files."""
     required = tuple(required_paths if required_paths is not None else files.core_model_paths())

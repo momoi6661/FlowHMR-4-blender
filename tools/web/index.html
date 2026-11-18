@@ -30,6 +30,7 @@
       <span class="workspace-tab" data-i18n="menu.layout">布局</span>
     </div>
     <div class="topbar-actions">
+      <button type="button" class="model-info model-button hidden" id="btnMcp" aria-haspopup="dialog" aria-controls="mcpDialog" data-i18n-title="mcp.title">MCP</button>
       <select id="languageSelect" class="input language-select" aria-label="界面语言" data-i18n-label="menu.language" data-i18n-title="menu.language">
         <option value="zh-CN" lang="zh-CN">简体中文</option>
         <option value="zh-TW" lang="zh-TW">繁體中文</option>
@@ -55,6 +56,8 @@
         <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m8 2 5 2.8v6.4L8 14l-5-2.8V4.8L8 2Zm-5 2.8 5 2.9 5-2.9M8 7.7V14"/></svg>
         <span data-i18n="models.short">模型</span> <span id="modelInfo" data-i18n="connection.connecting">正在连接</span>
       </button>
+      <button type="button" class="model-info model-button" id="btnReleaseGpu" disabled data-i18n="gpu.release" data-i18n-title="gpu.release_hint">释放显存</button>
+      <span class="model-info" id="gpuMessage" role="status"></span>
       <button type="button" class="model-info model-button hidden" id="btnRuntime" aria-haspopup="dialog" title="下载或切换运行环境" data-i18n-title="runtime.manage">
         <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3" y="3" width="10" height="10" rx="1"/><path d="M6 1v2m4-2v2M6 13v2m4-2v2M1 6h2m-2 4h2m10-4h2m-2 4h2"/></svg>
         <span data-i18n="runtime.title">运行环境</span> <span id="runtimeInfo"></span>
@@ -73,7 +76,7 @@
         <span class="preview-title" id="previewTitle"></span>
       </div>
       <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="选择视频" data-i18n-label="source.choose">
-        <input type="file" id="fileInput" accept="video/*" hidden>
+        <input type="file" id="fileInput" accept="video/*,image/png,image/jpeg,image/webp,image/bmp,.jfif" hidden>
         <svg viewBox="0 0 24 24" class="drop-icon" aria-hidden="true">
           <path d="M7 16a4 4 0 01-.88-7.9A5 5 0 1115.9 6H16a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
                 fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
@@ -89,11 +92,40 @@
         <button type="button" class="link-btn danger" id="fileRemove" data-i18n="source.remove">移除</button>
       </div>
       <p class="error hidden" id="uploadError"></p>
+      <div class="source-image-options hidden" id="imageOptions">
+        <label for="imageResolution" data-i18n="image.resolution">图片尺寸</label>
+        <select class="input" id="imageResolution">
+          <option value="AUTO" data-i18n="image.auto">自动适配</option>
+          <option value="ORIGINAL" data-i18n="image.original">保留原图尺寸</option>
+        </select>
+        <p class="card-help" id="imageInfo" role="status"></p>
+        <p class="card-help" data-i18n="image.hint">图片提取静态姿势；调整尺寸不能恢复模糊细节。原图不修改。需要修正单人人物框时，开启“多人手动选人”和“单人也显示选人框”。</p>
+      </div>
       <div class="preview-stage hidden" id="previewBox">
         <video id="previewVideo" playsinline preload="auto" tabindex="0" aria-label="原视频预览" data-i18n-label="source.preview"></video>
+        <img id="previewImage" class="hidden" alt="" draggable="false">
         <canvas id="previewCanvas"></canvas>
       </div>
       <p class="card-help hidden" id="previewIssue" role="status"></p>
+      <p class="card-help hidden" id="boxEditHint" role="status"></p>
+      <fieldset class="source-clip" id="sourceClip">
+        <legend data-i18n="timeline.range">处理区间</legend>
+        <div class="clip-fields">
+          <label for="clipStart"><span data-i18n="clip.start_seconds">起始（秒）</span>
+            <input id="clipStart" class="input" type="number" min="0" step="any" value="0" disabled>
+          </label>
+          <label for="clipEnd"><span data-i18n="clip.end_seconds">结束（秒）</span>
+            <input id="clipEnd" class="input" type="number" min="0" step="any" placeholder="片尾" disabled data-i18n-placeholder="clip.to_end">
+          </label>
+        </div>
+        <div class="clip-actions">
+          <button type="button" id="clipStartHere" class="btn-secondary small" disabled data-i18n="clip.start_here">当前画面设为起点</button>
+          <button type="button" id="clipEndHere" class="btn-secondary small" disabled data-i18n="clip.end_here">当前画面设为终点</button>
+          <button type="button" id="clipFull" class="link-btn" disabled data-i18n="timeline.full">全段</button>
+        </div>
+        <p class="card-help" id="clipSummary" role="status"></p>
+        <p class="card-help" data-i18n="clip.hint">先选视频，再设置秒数或拖动底部时间轴。只生成所选片段；结束时间不包含在内。</p>
+      </fieldset>
     </section>
 
     <!-- Person selection (only while a job waits for it) -->
@@ -101,6 +133,7 @@
       <h3 class="card-title" id="personTitle" data-i18n="person.choose">选择人物</h3>
       <p class="card-help" id="personCount"></p>
       <div class="person-list" id="personList"></div>
+      <button type="button" class="link-btn" id="boxReset" data-i18n="box.reset">撤销人物框修正</button>
       <button type="button" class="btn-primary block" id="personConfirm" disabled data-i18n="person.check">请勾选人物</button>
       <p class="error hidden" id="personError"></p>
       <button type="button" class="btn-secondary block rerun-btn hidden" id="personReselect"
@@ -118,8 +151,19 @@
         </button>
       </div>
       <div class="history-scroll">
+        <div class="history-filter">
+          <input class="input" type="search" id="historySearch" placeholder="搜索任务 / 素材" data-i18n-placeholder="history.search" aria-label="搜索任务" data-i18n-label="history.search">
+          <select class="input" id="historyFilter" aria-label="任务状态" data-i18n-label="history.filter">
+            <option value="ALL" data-i18n="history.all">全部状态</option>
+            <option value="done" data-i18n="job.done">已完成</option>
+            <option value="ACTIVE" data-i18n="history.active">处理中</option>
+            <option value="failed" data-i18n="job.failed">失败</option>
+            <option value="cancelled" data-i18n="job.cancelled">已停止</option>
+          </select>
+        </div>
         <p class="error hidden" id="historyError"></p>
         <p class="empty-note" id="historyEmpty" data-i18n="history.empty">暂无生成记录</p>
+        <p class="empty-note hidden" id="historyNoMatch" data-i18n="history.no_match">已加载任务中没有匹配项</p>
         <div class="runs" id="historyList"></div>
         <button type="button" class="btn-secondary small history-more hidden" id="historyMore" data-i18n="history.more">加载更多</button>
       </div>
@@ -165,10 +209,17 @@
       <p class="setting-help" id="cameraHint" data-i18n="camera.static_hint">仅平移、推拉或缩放通常选固定机位。镜头明显转向、俯仰或滚转时，选运动相机。</p>
       <div class="setting-row person-setting">
         <div>
-          <div class="setting-label" data-i18n="person.manual">手动选人</div>
-          <div class="setting-help" data-i18n="person.manual_hint">检测到多人时暂停，可勾选一人或多人</div>
+          <div class="setting-label" data-i18n="person.manual">多人手动选人</div>
+          <div class="setting-help" data-i18n="person.manual_hint">检测到多人时暂停，选择要生成动作的人物并调整框；关闭后自动选择主体。</div>
         </div>
-        <button type="button" class="toggle" id="optManual" role="switch" aria-label="手动选人" aria-checked="true" data-i18n-label="person.manual"><span class="toggle-knob"></span></button>
+        <button type="button" class="toggle" id="optManual" role="switch" aria-label="多人手动选人" aria-checked="true" data-i18n-label="person.manual"><span class="toggle-knob"></span></button>
+      </div>
+      <div class="setting-row person-setting person-single-setting" id="singleSelectRow">
+        <div>
+          <div class="setting-label" data-i18n="person.single">单人也显示选人框</div>
+          <div class="setting-help" data-i18n="person.single_hint">依赖上方开关。只有一个人时也暂停，供确认或移动、缩放人物框；图片和视频均适用。</div>
+        </div>
+        <button type="button" class="toggle" id="optSinglePerson" role="switch" aria-label="单人也显示选人框" aria-checked="false" data-i18n-label="person.single"><span class="toggle-knob"></span></button>
       </div>
       <p class="setting-help" id="rangeSummary"></p>
       <button type="button" class="btn-primary block run-btn" id="btnSubmit" disabled data-i18n="settings.generate">生成 3D 动作</button>
@@ -188,6 +239,13 @@
             <div class="setting-help" id="hamerHint" data-i18n="hamer.hint">精修手指 · 生成耗时增加</div>
           </div>
           <button type="button" class="toggle" id="optHamer" role="switch" aria-label="HaMeR 手指精修" aria-checked="false" aria-describedby="hamerHint" data-i18n-label="hamer.title"><span class="toggle-knob"></span></button>
+        </div>
+        <div class="setting-row" title="用 base 检查点多生成一次，只取骨盆、脊柱、颈头和头部的动作，并保持原动作的脚部位置。需要可选的「FlowHMR 躯干模型（base）」，可在「模型」中下载。" data-i18n-title="torso.tooltip">
+          <div>
+            <div class="setting-label" data-i18n="torso.title">躯干动作优化</div>
+            <div class="setting-help" id="torsoHint" data-i18n="torso.hint">略微增加耗时，显著提升扭跨等躯干动作质量</div>
+          </div>
+          <button type="button" class="toggle" id="optTorso" role="switch" aria-label="躯干动作优化" aria-checked="false" aria-describedby="torsoHint" data-i18n-label="torso.title"><span class="toggle-knob"></span></button>
         </div>
         <label class="field camera-mode hidden" id="hamerSamplingRow">
           <span data-i18n="hamer.stride">手指采样间隔</span>
@@ -239,7 +297,7 @@
         <div class="setting-row">
           <div>
             <div class="setting-label" data-i18n="sam.auto">自动选择 SAM 批次</div>
-            <div class="setting-help" id="samChunkHelp" data-i18n="sam.memory_hint">按任务开始时的可用显存估计</div>
+            <div class="setting-help" id="samChunkHelp" data-i18n="sam.memory_hint">运行时按显存和系统内存余量调整</div>
           </div>
           <button type="button" class="toggle" id="optSamAuto" role="switch" aria-label="自动选择 SAM 批次" aria-checked="true" data-i18n-label="sam.auto"><span class="toggle-knob"></span></button>
         </div>
@@ -254,6 +312,29 @@
         <p class="setting-help settings-note" data-i18n="sam.setting_note">
           手动批次可按显存调整。处理起止帧在底部时间轴设置。
         </p>
+        <hr class="property-divider">
+        <div class="setting-row hidden" id="samHybridRow">
+          <div>
+            <div class="setting-label" data-i18n="sam.backend">SAM 运行模式</div>
+            <div class="setting-help" id="samHybridHint" data-i18n="sam.hybrid_hint">混合模式用 CPU 提取图像特征，核显继续解码。可降低 GPU 内存占用，速度可能更慢。</div>
+          </div>
+          <select class="input setting-select" id="optSamBackend" data-i18n-label="sam.backend" aria-describedby="samHybridHint">
+            <option value="gpu" data-i18n="sam.backend_gpu">GPU</option>
+            <option value="hybrid" data-i18n="sam.backend_hybrid">CPU + GPU（省显存）</option>
+          </select>
+        </div>
+        <div class="setting-row" id="samHandStrideRow">
+          <div>
+            <div class="setting-label" data-i18n="sam.hand_stride">SAM 手部采样</div>
+            <div class="setting-help" id="samHandStrideHint" data-i18n="sam.hand_stride_hint">建议只在开启手指精修时使用：间隔越大处理速度越快，略微降低质量</div>
+          </div>
+          <select class="input setting-select" id="optSamHandStride"
+                  data-i18n-label="sam.hand_stride" aria-describedby="samHandStrideHint">
+            <option value="1" data-i18n="sam.hand_stride_off">逐帧（关闭）</option>
+            <option value="2" data-i18n="sam.hand_stride_two">每 2 帧</option>
+            <option value="4" data-i18n="sam.hand_stride_four">每 4 帧</option>
+          </select>
+        </div>
       </div>
     </section>
 
@@ -330,55 +411,11 @@
           </select>
         </label>
         <button type="button" class="btn-secondary small hidden" id="previewCharacter" data-i18n="character.button" data-i18n-title="character.title">角色</button>
-        <details class="editor-menu hidden" id="characterPoseMenu" data-keep-open>
-          <summary data-i18n="pose.menu">骨骼调节</summary>
-          <div class="editor-menu-popup character-pose-popup">
-            <div id="posePanelGrip" class="pose-panel-grip" title="拖动标题栏移动面板" data-i18n-title="pose.drag_panel">
-              <svg viewBox="0 0 12 16" aria-hidden="true"><path d="M3 3h.01M9 3h.01M3 8h.01M9 8h.01M3 13h.01M9 13h.01" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
-              <span data-i18n="pose.menu">骨骼调节</span>
-            </div>
-            <div class="pose-panel-body">
-              <label class="character-selection pose-person hidden" id="poseActorRow">
-                <span data-i18n="character.actor">人物</span>
-                <select class="input" id="poseActor"></select>
-              </label>
-              <div id="poseIkRow" class="character-selection pose-person hidden">
-                <span data-i18n="pose.pmx_mode">骨骼模式</span>
-                <div class="pose-tabs pose-ik-tabs">
-                  <button type="button" id="poseFkMode" aria-pressed="true" data-i18n-title="pose.pmx_fk_hint">FK</button>
-                  <button type="button" id="poseIkMode" aria-pressed="false" data-i18n-title="pose.pmx_ik_hint">IK</button>
-                </div>
-              </div>
-              <div class="pose-toolbar">
-                <div class="pose-tabs">
-                  <button type="button" id="poseBodyTab" aria-pressed="true" data-i18n="pose.body">身体</button>
-                  <button type="button" id="poseFingersTab" aria-pressed="false" data-i18n="pose.fingers">手指</button>
-                </div>
-                <button type="button" id="poseResetAll" data-i18n="pose.reset_all">重置全部</button>
-              </div>
-              <div class="pose-content">
-                <div>
-                  <div id="poseDiagram" class="pose-diagram"></div>
-                  <p class="pose-hint" id="poseDiagramHint"></p>
-                </div>
-                <div class="pose-controls">
-                  <div class="pose-joint-heading">
-                    <strong id="poseJointName"></strong>
-                    <span id="poseMappedName"></span>
-                  </div>
-                  <div id="poseRotationAxes"></div>
-                  <div id="poseTranslationAxes" class="hidden"></div>
-                  <div class="pose-joint-actions">
-                    <button type="button" id="poseResetJoint" data-i18n="pose.reset_joint">重置此骨骼</button>
-                    <button type="button" id="poseMirror" aria-pressed="false" data-i18n="pose.live_mirror"
-                            data-i18n-title="pose.live_mirror_hint" title="开启后，调整成对的骨骼时另一侧实时镜像">镜像调节</button>
-                  </div>
-                </div>
-              </div>
-              <p class="pose-hint pose-export-hint" data-i18n="pose.hint">实时作用于整段动作，按当前 PMX 角色导出 VMD 时会保留。</p>
-            </div>
-          </div>
-        </details>
+        <button type="button" class="btn-secondary small" id="posePresetOpen" disabled data-i18n="preset.open">手脚预设</button>
+        <div class="retarget-launch">
+          <button type="button" class="btn-secondary small hidden" id="retargetCurrent" aria-controls="retargetActorMenu" data-i18n="retarget.title">重定向</button>
+          <div class="editor-menu-popup hidden" id="retargetActorMenu" role="group" data-i18n-label="character.actor"></div>
+        </div>
         <span class="result-info" id="resultInfo"></span>
       </div>
       <div class="downloads">
@@ -392,7 +429,7 @@
       </div>
     </div>
     <div class="viewer-wrap">
-      <div id="viewer"></div>
+      <div id="viewer" tabindex="-1"></div>
       <div class="viewport-label"><strong id="viewportName" data-i18n="view.user_perspective">用户透视</strong><span id="viewportObject" data-i18n="view.scene">场景集合</span></div>
       <div class="viewport-toolbar" aria-label="视窗工具" data-i18n-label="view.tools">
         <button type="button" class="editor-icon" data-mouse-mode="rotate" aria-pressed="false" aria-label="旋转视图" title="左键旋转，中键平移" data-i18n-label="view.rotate" data-i18n-title="view.rotate_hint"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15.5 6.5A6.4 6.4 0 1 0 16 12M15.5 2.5v4h-4"/></svg></button>
@@ -439,6 +476,12 @@
           <option value="1" selected>1×</option>
           <option value="2">2×</option>
         </select>
+        <select id="displayFps" class="select" aria-label="时间轴显示帧率" data-i18n-label="timeline.display_fps" data-i18n-title="timeline.display_fps">
+          <option value="0" data-i18n="timeline.source_fps">素材帧率</option>
+          <option value="24">24 FPS</option><option value="25">25 FPS</option>
+          <option value="30">30 FPS</option><option value="48">48 FPS</option>
+          <option value="50">50 FPS</option><option value="60">60 FPS</option><option value="120">120 FPS</option>
+        </select>
       </div>
       <span class="timeline-rate" id="timelineRange">30 FPS</span>
     </div>
@@ -465,7 +508,7 @@
   <div class="editor-splitter splitter-timeline" data-split="timeline" role="separator" tabindex="0" aria-orientation="horizontal" aria-label="调整时间轴高度" title="拖动调整时间轴高度，双击恢复" data-i18n-label="layout.timeline" data-i18n-title="layout.timeline_hint"></div>
 </main>
 
-<footer class="workspace-status"><span id="viewControlHint" data-i18n="view.pan_status">左键平移 · 中键/右键旋转 · 滚轮缩放 · 空格播放</span><span id="workspaceState">FlowHMR</span></footer>
+<footer class="workspace-status"><span id="viewControlHint" data-i18n="view.pan_status">左键平移 · 中键/右键旋转 · 滚轮缩放 · 空格播放</span><span id="mcpActivityStatus" role="status"></span><span id="workspaceState">FlowHMR</span></footer>
 
 <dialog id="modelDialog" class="model-dialog" aria-labelledby="modelTitle">
   <header class="model-dialog-head">
@@ -544,6 +587,40 @@
   </footer>
 </dialog>
 
+<dialog id="mcpDialog" class="model-dialog" aria-labelledby="mcpTitle">
+  <header class="model-dialog-head">
+    <h3 id="mcpTitle" data-i18n="mcp.title">MCP 服务设置</h3>
+    <form method="dialog"><button type="submit" class="editor-icon" aria-label="关闭" title="关闭" data-i18n-label="common.close" data-i18n-title="common.close">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg>
+    </button></form>
+  </header>
+  <p class="model-hint" data-i18n="mcp.hint">供本机 Agent 导入视频与角色、调整参数和骨骼偏移、查询任务和导出动作。</p>
+  <div class="mcp-fields">
+    <label class="mcp-reveal"><input type="checkbox" id="mcpAutoStart"><span data-i18n="mcp.auto_start">自动开启 MCP</span></label>
+    <p class="setting-help" data-i18n="mcp.auto_start_hint">软件启动后自动开启 MCP 服务。</p>
+    <label><span data-i18n="mcp.port">端口</span><input class="input" id="mcpPort" type="number" min="1024" max="65535" step="1" value="60551"></label>
+    <label><span data-i18n="mcp.url">连接地址</span><input class="input" id="mcpUrl" readonly></label>
+    <label class="mcp-reveal"><input type="checkbox" id="mcpAuth"><span data-i18n="mcp.auth">启用访问令牌</span></label>
+    <label id="mcpTokenRow" class="hidden"><span data-i18n="mcp.token">访问令牌</span><input class="input" id="mcpToken" type="password" readonly autocomplete="off"></label>
+    <label id="mcpRevealRow" class="mcp-reveal hidden"><input type="checkbox" id="mcpReveal"><span data-i18n="mcp.reveal">显示令牌</span></label>
+    <div class="model-actions">
+      <button type="button" class="btn-secondary small" id="mcpCopy" data-i18n="mcp.copy">复制连接配置</button>
+      <button type="button" class="btn-secondary small" id="mcpReset" data-i18n="mcp.reset">重置令牌</button>
+    </div>
+  </div>
+  <section class="mcp-fields">
+    <h4 data-i18n="mcp.activity">最近 MCP 操作与导出</h4>
+    <div id="mcpActivityList" class="mcp-activity-list" aria-live="polite"></div>
+  </section>
+  <footer class="model-dialog-foot">
+    <span id="mcpStatus" role="status" aria-live="polite"></span>
+    <div class="model-actions">
+      <button type="button" class="btn-secondary small" id="mcpTest" data-i18n="mcp.test">验证连接</button>
+      <button type="button" class="btn-primary small" id="mcpToggle" data-i18n="mcp.start">启动服务</button>
+    </div>
+  </footer>
+</dialog>
+
 <dialog id="runtimeDialog" class="model-dialog runtime-dialog" aria-labelledby="runtimeTitle">
   <header class="model-dialog-head">
     <h2 id="runtimeTitle" data-i18n="runtime.title">运行环境</h2>
@@ -579,14 +656,23 @@
       <span data-i18n="export.format">格式</span>
       <select id="motionExportFormat" class="input">
         <option value="flowhmr">FlowHMR FBX</option>
+        <option value="retarget_fbx" data-i18n="retarget.fbx">当前角色 FBX</option>
         <option value="mixamo">Mixamo FBX</option>
         <option value="metahuman">MetaHuman FBX</option>
         <option value="maya_adv">Maya AdvancedSkeleton FBX</option>
+        <option value="retarget_glb" data-i18n="retarget.glb">VRM 角色 GLB</option>
         <option value="vmd">MMD VMD</option>
         <option value="vrma">VRM Animation (.vrma)</option>
       </select>
     </label>
     <p class="setting-help export-format-hint" id="motionExportHint"></p>
+    <div id="mixamoRigOptions" class="character-file hidden">
+      <select class="input" id="mixamoRig" aria-label="骨架" data-i18n-label="export.fbx_rig">
+        <option value="target" id="mixamoRigCharacter"></option>
+        <option value="generic" data-i18n="export.mixamo_generic">通用 Mixamo 骨架</option>
+      </select>
+    </div>
+    <button type="button" class="btn-secondary small hidden" id="fbxChooseCharacter" data-i18n="export.open_characters">打开角色</button>
     <div id="vmdOptions" class="character-file hidden">
       <select class="input" id="vmdTarget" aria-label="PMX 模型" data-i18n-label="character.file">
         <option value="target" id="vmdTargetCharacter"></option>
@@ -600,24 +686,18 @@
     </fieldset>
     <div id="standardFbxOptions">
       <label class="fbx-export-skin"><input type="checkbox" id="fbxWithSkin"> <span data-i18n="export.skin">包含蒙皮网格</span></label>
-      <p class="setting-help" data-i18n="export.skin_hint">带蒙皮时使用当前预览体型。仅用于重定向时，导出动画骨架即可。</p>
-      <label class="fbx-export-pose" for="fbxFirstPose">
-        <span data-i18n="export.reference">参考姿势</span>
-        <select id="fbxFirstPose" class="input">
-          <option value="none" data-i18n="export.none">不添加</option>
-          <option value="t">T Pose</option>
-          <option value="a">A Pose</option>
-        </select>
-      </label>
-      <p class="setting-help" data-i18n="export.reference_hint">参考姿势是 FBX 第 −1 帧的关键帧。Blender 默认导入后在第 0 帧，需切到姿态位置查看。</p>
-    </div>
-    <div class="field fbx-template hidden" id="fbxTemplateRow">
-      <label for="fbxTemplate" id="fbxTemplateLabel" data-i18n="export.metahuman_template">目标身体骨架（FBX）</label>
-      <div class="fbx-template-controls">
-        <input class="input" type="file" id="fbxTemplate" accept=".fbx">
-        <button type="button" class="btn-secondary small hidden" id="fbxTemplateClear" data-i18n="export.clear_template">清除模板</button>
+      <p class="setting-help" id="fbxSkinHint" data-i18n="export.skin_hint">带蒙皮时使用当前预览体型。仅用于重定向时，导出动画骨架即可。</p>
+      <div id="fbxReferenceOptions">
+        <label class="fbx-export-pose" for="fbxFirstPose">
+          <span data-i18n="export.reference">参考姿势</span>
+          <select id="fbxFirstPose" class="input">
+            <option value="none" data-i18n="export.none">不添加</option>
+            <option value="t">T Pose</option>
+            <option value="a">A Pose</option>
+          </select>
+        </label>
+        <p class="setting-help" data-i18n="export.reference_hint">参考姿势是 FBX 第 −1 帧的关键帧。Blender 默认导入后在第 0 帧，需切到姿态位置查看。</p>
       </div>
-      <p class="setting-help hidden" id="fbxTemplateHint" data-i18n="export.mixamo_hint">选择目标角色的原版 Mixamo FBX。导出会保留模板自带的蒙皮。留空时使用通用 Mixamo 骨架。</p>
     </div>
     <p class="error hidden" id="motionExportError" role="alert"></p>
     <div class="fbx-export-actions">
@@ -627,18 +707,25 @@
   </form>
 </dialog>
 
-<dialog id="previewCharacterDialog" class="fbx-export-dialog" aria-labelledby="previewCharacterTitle">
+<dialog id="previewCharacterDialog" class="fbx-export-dialog character-dialog" aria-labelledby="previewCharacterTitle">
   <form method="dialog">
-    <h3 class="card-title" id="previewCharacterTitle" data-i18n="character.title">预览角色</h3>
-    <p class="setting-help" data-i18n="character.guide">选择 PMX、VRM 或带蒙皮的 Mixamo / MetaHuman FBX。外置贴图请放在 PMX 或 FBX 旁边。</p>
+    <header class="character-dialog-head">
+      <h3 class="card-title" id="previewCharacterTitle" data-i18n="character.title">预览角色</h3>
+      <button class="editor-icon" id="characterDialogCancel" value="cancel" aria-label="取消" data-i18n-label="common.cancel">×</button>
+    </header>
     <label class="character-selection hidden" id="characterActorRow">
       <span data-i18n="character.actor">人物</span>
       <select class="input" id="characterActor"></select>
     </label>
-    <div class="character-selection">
-      <label for="characterLibrary" data-i18n="character.library">角色库</label>
-      <select class="input" id="characterLibrary"></select>
-      <button type="button" class="btn-secondary small character-remove" id="characterDelete" data-i18n="character.library_delete" disabled>删除</button>
+    <div class="character-library">
+      <div class="character-library-bar">
+        <button type="button" id="characterLibraryToggle" class="input character-library-toggle" aria-controls="characterLibraryGrid" aria-expanded="false">
+          <span class="character-section-label" data-i18n="character.library">角色库</span><span id="characterLibraryLabel"></span>
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
+        </button>
+        <button type="button" class="btn-secondary small character-remove" id="characterDelete" data-i18n="character.library_delete" disabled>删除</button>
+      </div>
+      <div class="character-library-grid hidden" id="characterLibraryGrid" role="group" data-i18n-label="character.library"></div>
     </div>
     <div class="character-delete-confirm hidden" id="characterDeleteConfirm" role="group" aria-labelledby="characterDeleteMessage">
       <p class="setting-help" id="characterDeleteMessage"></p>
@@ -647,22 +734,228 @@
         <button type="button" class="btn-secondary small character-remove" id="characterDeleteConfirmButton" data-i18n="character.library_confirm_button">删除角色</button>
       </div>
     </div>
-    <p class="setting-help" data-i18n="character.library_hint">在桌面版应用新角色时，模型和引用的贴图会存入 models/characters。角色选择和骨骼调节会自动记住。</p>
     <div class="character-file">
       <input type="file" id="pmxFolder" webkitdirectory multiple hidden>
       <input type="file" id="characterModelFile" accept=".pmx,.vrm,.fbx" hidden>
       <button type="button" class="btn-secondary small" id="characterBrowse" data-i18n="character.pick">选择模型文件…</button>
       <button type="button" class="btn-secondary small hidden" id="pmxBrowse" data-i18n="character.folder">选择模型文件夹…</button>
       <select class="input hidden" id="pmxFile" data-i18n-label="character.file" aria-label="角色模型"></select>
+      <span class="character-formats" aria-hidden="true">PMX · VRM · FBX</span>
     </div>
     <p class="setting-help" id="pmxStatus" role="status"></p>
+    <div class="character-delete-confirm hidden" id="characterRetargetPrompt" role="group" aria-labelledby="characterRetargetMessage">
+      <p class="setting-help" id="characterRetargetMessage" role="status"></p>
+      <div class="fbx-export-actions">
+        <button type="button" class="btn-secondary small" id="characterRetargetCancel" data-i18n="common.cancel">取消</button>
+        <button type="button" class="btn-primary small" id="characterRetargetStart" data-i18n="retarget.start">开始重定向</button>
+      </div>
+    </div>
     <p class="error hidden" id="pmxError" role="alert"></p>
     <div class="fbx-export-actions">
       <button type="button" class="btn-secondary small" id="pmxRestore" data-i18n="character.restore">恢复 SMPL-H</button>
-      <button class="btn-secondary small" id="characterDialogCancel" value="cancel" data-i18n="common.cancel">取消</button>
       <button class="btn-primary small" id="pmxApply" value="apply" disabled data-i18n="character.apply">应用角色</button>
     </div>
   </form>
+</dialog>
+
+<dialog id="posePresetDialog" class="fbx-export-dialog pose-preset-dialog" aria-labelledby="posePresetTitle">
+  <form method="dialog">
+    <h3 class="card-title" id="posePresetTitle" data-i18n="preset.open">手脚预设</h3>
+    <p class="setting-help" data-i18n="preset.hint">保存生成动作当前帧的局部姿势。手部包含手腕和手指；脚部包含脚踝和脚趾，不改变腿部和人物位移。角色骨骼调节不计入。</p>
+    <label class="field"><span data-i18n="character.actor">人物</span><select class="input" id="presetActor"></select></label>
+    <fieldset class="preset-fields" id="presetFields">
+      <legend data-i18n="preset.capture">保存姿势</legend>
+      <div class="preset-grid">
+        <label class="field"><span data-i18n="preset.name">名称</span><input class="input" id="presetName" maxlength="80" data-i18n-placeholder="preset.example" placeholder="例如：左手握门把手"></label>
+        <label class="field"><span data-i18n="preset.part">部位</span><select class="input" id="presetPart">
+          <option value="left_hand" data-i18n="preset.left_hand">左手</option><option value="right_hand" data-i18n="preset.right_hand">右手</option>
+          <option value="hands" data-i18n="preset.hands">双手</option><option value="left_foot" data-i18n="preset.left_foot">左脚</option>
+          <option value="right_foot" data-i18n="preset.right_foot">右脚</option><option value="feet" data-i18n="preset.feet">双脚</option>
+        </select></label>
+      </div>
+      <div class="preset-actions">
+        <label class="field"><span data-i18n="preset.frame">动作帧</span><input class="input" id="presetFrame" type="number" min="1" step="1" value="1"></label>
+        <button type="button" class="btn-secondary small" id="presetCurrent" data-i18n="preset.current">读取当前帧</button>
+        <button type="button" class="btn-primary small" id="presetSave" data-i18n="preset.save">保存为预设</button>
+      </div>
+      <h4 class="preset-section-title" data-i18n="preset.library">调用预设</h4>
+      <p class="setting-help" data-i18n="preset.project_storage">自动保存在项目内，Blender 与网页共用；关闭或更新插件后保留。</p>
+      <p class="setting-help" id="presetDirectory" style="overflow-wrap:anywhere"></p>
+      <label class="field"><span data-i18n="preset.saved">已保存</span><select class="input" id="presetList"></select></label>
+      <div class="preset-actions">
+        <button type="button" class="btn-secondary small" id="presetRefresh" data-i18n="preset.refresh">刷新预设库</button>
+        <button type="button" class="btn-secondary small" id="presetImport" data-i18n="preset.import">导入 JSON</button>
+        <input type="file" id="presetFile" accept=".json,application/json" hidden>
+        <button type="button" class="btn-secondary small" id="presetExport" data-i18n="preset.export">导出 JSON</button>
+        <button type="button" class="btn-secondary small" id="presetDelete" data-i18n="preset.delete">删除预设</button>
+      </div>
+      <div class="preset-grid">
+        <label class="field"><span data-i18n="preset.start">起始动作帧</span><input class="input" id="presetStart" type="number" min="1" step="1" value="1"></label>
+        <label class="field"><span data-i18n="preset.end">结束动作帧（含）</span><input class="input" id="presetEnd" type="number" min="1" step="1" value="1"></label>
+        <label class="field"><span data-i18n="preset.strength">强度（%）</span><input class="input" id="presetStrength" type="number" min="1" max="100" step="1" value="100"></label>
+        <label class="field"><span data-i18n="preset.blend">边缘过渡帧</span><input class="input" id="presetBlend" type="number" min="0" max="120" step="1" value="5"></label>
+      </div>
+      <div class="preset-actions">
+        <button type="button" class="btn-secondary small" id="presetOneFrame" data-i18n="preset.one_frame">仅当前帧</button>
+        <button type="button" class="btn-secondary small" id="presetAllFrames" data-i18n="preset.all_frames">整段动作</button>
+      </div>
+      <p class="setting-help" data-i18n="preset.apply_hint">帧号从所选人物的动作第 1 帧开始。预设会替换所选部位在区间内的局部旋转，并生成一份独立结果；原结果保留。不会创建门或约束手脚接触。</p>
+    </fieldset>
+    <p class="setting-help" id="presetStatus" role="status" aria-live="polite"></p>
+    <p class="error hidden" id="presetError" role="alert"></p>
+    <div class="fbx-export-actions">
+      <button type="button" class="btn-secondary small" id="presetClose" data-i18n="preset.close">关闭</button>
+      <button type="button" class="btn-primary small" id="presetApply" data-i18n="preset.apply">应用并生成副本</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="retargetDialog" class="fbx-export-dialog retarget-dialog" aria-labelledby="retargetTitle">
+  <header class="character-dialog-head" id="retargetGrip">
+    <span class="retarget-grip-mark" aria-hidden="true">⠿</span>
+    <div><h3 class="card-title" id="retargetTitle" data-i18n="retarget.title">重定向</h3><p id="retargetModel" class="setting-help"></p></div>
+    <details id="retargetShortcuts" class="retarget-shortcuts">
+      <summary data-i18n="retarget.shortcuts">快捷键</summary>
+      <div class="retarget-shortcut-panel">
+        <div class="retarget-shortcut-line"><span data-i18n="retarget.probe_rotate">旋转</span><button type="button" class="btn-secondary small" data-retarget-shortcut="rotate">R</button></div>
+        <div class="retarget-shortcut-line"><span data-i18n="retarget.probe_move">移动</span><button type="button" class="btn-secondary small" data-retarget-shortcut="move">G</button></div>
+        <div class="retarget-shortcut-line"><span data-i18n="retarget.probe_scale">缩放</span><button type="button" class="btn-secondary small" data-retarget-shortcut="scale">S</button></div>
+        <p id="retargetShortcutHint" class="retarget-small" role="status"></p>
+        <button type="button" id="retargetShortcutReset" class="btn-secondary small" data-i18n="retarget.shortcut_reset">恢复默认快捷键</button>
+      </div>
+    </details>
+    <button type="button" class="editor-icon" id="retargetClose" aria-label="取消" data-i18n-label="common.cancel">×</button>
+  </header>
+  <div class="retarget-columns">
+    <section class="retarget-source">
+      <div class="retarget-heading retarget-source-title">
+        <span>SMPL-H</span>
+        <select id="retargetReference" class="input" data-i18n-label="retarget.reference" data-i18n-title="retarget.reference_hint" aria-describedby="retargetRestPose">
+          <option value="auto" data-i18n="retarget.reference_auto">自动</option>
+          <option value="t">T Pose</option>
+          <option value="a">A Pose</option>
+        </select>
+      </div>
+      <div id="retargetRestPose" class="retarget-pose-badge" role="status"></div>
+      <div class="retarget-tabs">
+        <button type="button" class="btn-secondary small" data-retarget-tab="body" data-i18n="pose.body">身体</button>
+        <button type="button" class="btn-secondary small" data-retarget-tab="left" data-i18n="retarget.left_hand">左手</button>
+        <button type="button" class="btn-secondary small" data-retarget-tab="right" data-i18n="retarget.right_hand">右手</button>
+      </div>
+      <div id="retargetSourceDiagram" class="pose-diagram"></div>
+      <div id="retargetProgress" class="retarget-small retarget-source-notes" role="status"></div>
+      <details class="retarget-presets" id="retargetPresets" open>
+        <summary id="retargetPresetSummary" data-i18n="retarget.presets">重定向预设</summary>
+        <div class="retarget-preset-controls">
+          <div id="retargetPresetGallery" class="retarget-preset-gallery" role="group" data-i18n-label="retarget.presets"></div>
+          <div class="retarget-preset-row">
+            <div class="retarget-preset-actions">
+              <button type="button" class="btn-secondary small" id="retargetPresetLoad" data-i18n="retarget.preset_apply" disabled>载入并编辑</button>
+              <button type="button" class="btn-secondary small character-remove hidden" id="retargetPresetDelete" data-i18n="retarget.preset_delete">删除</button>
+              <button type="button" class="btn-secondary small hidden" id="retargetPresetSaveBuiltin" data-i18n="retarget.preset_save_builtin">保存到预设</button>
+              <button type="button" class="btn-secondary small hidden" id="retargetPresetReset" data-i18n="retarget.preset_reset">恢复默认</button>
+              <button type="button" class="btn-secondary small" id="retargetRebuildMap" data-i18n="retarget.restart_map">重新映射</button>
+            </div>
+            <div class="retarget-preset-new">
+              <label><input type="checkbox" id="retargetSavePreset"> <span data-i18n="retarget.save_preset">同时保存为可复用预设</span></label>
+              <label class="hidden" id="retargetPresetNameRow">
+                <input type="text" id="retargetPresetName" class="input" maxlength="80" autocomplete="off" data-i18n-label="retarget.preset_name" data-i18n-placeholder="retarget.preset_name">
+              </label>
+            </div>
+          </div>
+          <p class="retarget-small" id="retargetPresetHint" role="status"></p>
+          <p class="retarget-small hidden" id="retargetPresetGalleryStatus" role="status"></p>
+          <div class="retarget-preset-confirm hidden" id="retargetPresetConfirm" role="group" aria-labelledby="retargetPresetConfirmMessage">
+            <p id="retargetPresetConfirmMessage"></p>
+            <div class="retarget-preset-actions">
+              <button type="button" class="btn-secondary small" id="retargetPresetCancel" data-i18n="common.cancel">取消</button>
+              <button type="button" class="btn-secondary small" id="retargetPresetConfirmButton"></button>
+            </div>
+          </div>
+        </div>
+      </details>
+    </section>
+    <section class="retarget-target">
+      <div class="retarget-target-head">
+        <label id="retargetLinkLabel" class="retarget-heading" for="retargetSearch" data-i18n="retarget.target_3d">目标骨架 · 3D</label>
+        <div class="retarget-view-tools">
+          <button type="button" class="btn-secondary small" id="retargetSkin" aria-pressed="false" data-i18n="view.skin" data-i18n-title="view.skin_hint">蒙皮</button>
+          <button type="button" class="btn-secondary small" id="retargetCones" aria-pressed="false" data-i18n="retarget.cones" data-i18n-title="view.cones_hint">锥体</button>
+        </div>
+      </div>
+      <div id="retargetTargetDiagram" class="retarget-target-diagram">
+        <div id="retargetInspectSkin" class="hidden" aria-hidden="true"></div>
+        <canvas id="retargetTargetCanvas" tabindex="0" data-i18n-label="retarget.target_3d" aria-describedby="retargetNavigation"></canvas>
+        <div id="retargetHoverBone" class="retarget-hover-bone hidden" aria-hidden="true"></div>
+        <div id="retargetBoneChoices" class="retarget-pick-menu hidden" role="group" data-i18n-label="retarget.pick_overlap"></div>
+      </div>
+      <p id="retargetNavigation" class="retarget-navigation" aria-live="polite"></p>
+      <div class="retarget-search">
+        <input type="search" class="input" id="retargetSearch" autocomplete="off" data-i18n-placeholder="retarget.search" data-i18n-label="retarget.search">
+      </div>
+      <div id="retargetBoneList" class="retarget-bones" role="group" data-i18n-label="retarget.target"></div>
+    </section>
+    <section class="retarget-controls">
+      <div id="retargetIkModes" class="retarget-solve-mode hidden" role="group" aria-labelledby="retargetSolveLabel" aria-describedby="retargetIkModeHint">
+        <div class="retarget-solve-row">
+          <span id="retargetSolveLabel" data-i18n="retarget.solve_mode">求解方式</span>
+          <div class="retarget-tabs">
+            <button type="button" class="btn-secondary small" id="retargetModeFk">FK</button>
+            <button type="button" class="btn-secondary small" id="retargetModeIk">IK</button>
+          </div>
+        </div>
+        <p id="retargetIkModeHint" class="retarget-small" data-i18n="retarget.ik_unavailable">还未设置脚部 IK 控制器。</p>
+      </div>
+      <div class="retarget-calibration">
+        <p class="retarget-guide-step" id="retargetStep"></p>
+        <div class="retarget-heading" id="retargetJoint"></div>
+        <p id="retargetBinding" class="retarget-binding"></p>
+        <p id="retargetMatchStatus" class="retarget-small" role="status"></p>
+        <div class="retarget-guide-actions">
+          <button type="button" class="btn-primary small" id="retargetConfirm" data-i18n="retarget.confirm_next">确认并继续</button>
+          <button type="button" class="btn-secondary small" id="retargetNext" data-i18n="retarget.skip_step">跳到下一根</button>
+          <button type="button" class="btn-secondary small hidden" id="retargetSkipHand" data-i18n="retarget.guide_skip_hand">跳过这只手的手指</button>
+          <button type="button" class="btn-secondary small hidden" id="retargetUseAutoRoot" data-i18n="retarget.guide_use_auto_root">使用自动重心</button>
+          <button type="button" class="btn-secondary small hidden" id="retargetDiscard" data-i18n="retarget.discard_choice">取消选择</button>
+          <button type="button" class="btn-secondary small hidden" id="retargetClear" data-i18n="retarget.remove_match">取消匹配</button>
+        </div>
+        <p id="retargetMirrorStatus" class="retarget-small hidden" aria-live="polite"></p>
+        <details id="retargetOffsets" class="retarget-offsets" open>
+          <summary data-i18n="retarget.offsets">校正值</summary>
+          <div id="retargetAxes"></div>
+          <p id="retargetMoveHint" class="retarget-small hidden" data-i18n="retarget.pmx_move">此 PMX 骨骼不允许移动。</p>
+          <button type="button" class="btn-secondary small" id="retargetResetJoint" data-i18n="retarget.reset_offsets" data-i18n-title="pose.reset_joint">归零</button>
+        </details>
+        <details class="retarget-ik" id="retargetIk">
+          <summary data-i18n="retarget.ik">IK 控制器</summary>
+          <p id="retargetIkHint" class="retarget-small"></p>
+          <div id="retargetIkSlots"></div>
+        </details>
+        <div id="retargetMetrics" class="retarget-metrics retarget-small"></div>
+      </div>
+      <aside id="retargetWorkflow" class="retarget-workflow" aria-labelledby="retargetWorkflowTitle">
+        <div id="retargetWorkflowTitle" data-i18n="retarget.workflow_title">操作指引</div>
+        <ol>
+          <li data-i18n="retarget.workflow_source">先在左侧选 SMPL-H 骨骼。</li>
+          <li data-i18n="retarget.workflow_target">点选目标骨骼，或按名称搜索。</li>
+          <li data-i18n="retarget.workflow_confirm">确认匹配，继续处理下一根。</li>
+          <li data-i18n="retarget.workflow_finish">试用检查动作，再保存并应用。</li>
+        </ol>
+        <p id="retargetTutorialKeys" class="retarget-small"></p>
+      </aside>
+    </section>
+  </div>
+  <p class="error hidden" id="retargetError" role="alert"></p>
+  <p class="retarget-small retarget-save-hint" id="retargetSaveHint"></p>
+  <footer class="retarget-footer">
+    <button type="button" class="btn-secondary small" id="retargetAuto" data-i18n="retarget.auto">按名称匹配</button>
+    <button type="button" class="btn-secondary small" id="retargetMirror" aria-pressed="true" data-i18n="retarget.mirror" data-i18n-title="retarget.mirror_hint">自动镜像</button>
+    <button type="button" class="btn-secondary small" id="retargetUndo" aria-keyshortcuts="Control+Z Meta+Z" data-i18n="retarget.undo">撤销</button>
+    <button type="button" class="btn-secondary small" id="retargetPreview" data-i18n="retarget.preview">试用到视图</button>
+    <button type="button" class="btn-primary small" id="retargetSave" data-i18n="retarget.save">保存并应用</button>
+  </footer>
+  <button type="button" id="retargetResize" aria-keyshortcuts="ArrowUp ArrowDown ArrowLeft ArrowRight"
+    data-i18n-label="retarget.resize" data-i18n-title="retarget.resize"></button>
 </dialog>
 
 <script type="module" src="/static/js/main.js"></script>

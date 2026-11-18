@@ -4,7 +4,7 @@ Launch (from the repo root):
     python app.py --ckpt models/flowhmr_latest/flowhmr_latest.ckpt --port 8080
 then open http://<host>:8080
 
-Pipeline per job (runs on one GPU, jobs are queued):
+Pipeline per job (jobs are queued):
     transcode 30fps -> YOLOX detection + tracking -> VGGT-Omega camera
     -> SAM-3D-Body tokens -> FlowHMR flow-matching generation
 """
@@ -12,6 +12,7 @@ import argparse
 import base64
 import binascii
 import copy
+import gc
 import hashlib
 import hmac
 import json
@@ -28,6 +29,7 @@ import time
 import traceback
 import uuid
 from collections import defaultdict
+from contextlib import closing, contextmanager
 from functools import wraps
 from importlib.util import find_spec
 from pathlib import Path
@@ -35,30 +37,44 @@ from urllib.parse import urlsplit
 from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
 
 import numpy as np
-from flask import Flask, abort, jsonify, request, send_file, send_from_directory
+from flask import Flask, Response, abort, jsonify, request, send_file, send_from_directory
+from werkzeug.serving import make_server
 
 WEB_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(os.path.dirname(WEB_DIR))
 sys.path.insert(0, REPO_ROOT)
 
-from flowhmr.utils.runtime_capabilities import SOLE_FIT_REFERENCE_STRENGTH, native_correction_available
-from flowhmr.utils.runtime_hamer import hamer_available, HAMER_STRIDES, MISSING_HAMER
+from flowhmr.utils.runtime_capabilities import (
+    EmptyPersonRangeError, InferenceRAMError, SAMMemoryError, SharedCameraSamplingError, SharedGPUMemoryError,
+    SOLE_FIT_REFERENCE_STRENGTH, cached_detection_matches, native_correction_available, requested_frame_range,
+)
+from flowhmr.utils.runtime_hamer import hamer_available, HAMER_ISSUES, HAMER_STRIDES, MISSING_HAMER
 from flowhmr.utils.runtime_preview_inspection import PreviewInspection
 from flowhmr.utils.runtime_preview_thumbnail import ensure_thumbnail
 from flowhmr.core.bodymodels.body_variants import available_variants, model_path, write_preview_vertices
 from flowhmr.model_files import (
-    MODEL_ROOT, SMPLH_FILES, core_model_paths, ensure_model_folders, flowhmr_paths, missing_model_paths,
-    smplh_reference,
+    FLOWHMR_BASE_FILES, HAMER_FILES, MODEL_ROOT, SAM3D_FILES, VGGT, SMPLH_FILES, core_model_paths,
+    ensure_model_folders, flowhmr_base_paths, flowhmr_paths, missing_model_paths, resolve_model,
+    smplh_reference, torso_optimization_available,
 )
 from flowhmr import model_integrity
-from flowhmr.character_files import CharacterFiles, KEY_ENV as CHARACTER_KEY_ENV
-from flowhmr.character_library import CharacterLibrary
+from flowhmr.character_files import CharacterFiles, KEY_ENV as CHARACTER_KEY_ENV, MAX_MODEL_BYTES
+from flowhmr.character_library import CharacterLibrary, RetargetPresetError, THUMBNAIL_BYTES
 from flowhmr.model_sources import PUBLIC_ASSETS
 from flowhmr.model_import import ModelImporter, ModelImportError
 from flowhmr.model_inventory import model_inventory
 from flowhmr.model_downloads import ACTIVE_DOWNLOAD, DownloadError, ModelDownloads, missing_downloads
+from flowhmr.device_support import DEVICE_HELP, DeviceError, backend_summary, plan_device, resolve_device
 from flowhmr.runtime_environments import RUNTIME
 from flowhmr import runtime_rocm
+from flowhmr.mcp.service import MCPService
+from flowhmr.mcp.contract import (Parameters as MCPParameters, ExportOptions as MCPExportOptions,
+                                  SERVICE_KEY_HEADER, TOOL_NAMES, parameter_defaults, single_result_person_id)
+from flowhmr.mcp.characters import BONES, PosePatch, can_request_ik, empty_pose, import_character
+from flowhmr.mcp.activity import Activity
+from flowhmr.mcp.events import UIEvents
+from flowhmr.box_edits import validate_edits, apply_to_tracks
+from flowhmr.pose_presets import PosePresets, capture_preset, read_motion, apply_preset
 
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 STAGES = [
@@ -74,6 +90,147 @@ SUB = "input"  # every job stores its upload as input.<ext>, so intermediates li
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024
+MCP_SERVICE = MCPService(REPO_ROOT)
+MCP_ACTIVITY = Activity()
+UI_EVENTS = UIEvents()
+MCP_SERVICE.on_change = lambda: UI_EVENTS.publish('mcp_service')
+
+
+@app.after_request
+def notify_ui_changes(response):
+    if request.path == '/api/mcp':
+        response.headers['Cache-Control'] = 'no-store'
+    if request.method in ('POST', 'PUT', 'PATCH', 'DELETE') and response.status_code < 300:
+        path = request.path
+        if path == '/api/upload' or path.startswith('/api/jobs'):
+            UI_EVENTS.publish('jobs')
+        elif path.startswith('/api/character-library') or path.startswith('/api/mcp/characters') or (
+                path.startswith('/api/mcp/jobs/') and path.endswith('/character')):
+            UI_EVENTS.publish('characters')
+        elif path == '/api/mcp':
+            UI_EVENTS.publish('mcp_service')
+    return response
+
+
+@app.get('/api/ui/events')
+def api_ui_events():
+    if not local_model_request() or request.headers.get('Sec-Fetch-Site') == 'cross-site':
+        abort(403)
+    try:
+        cursor = int(request.headers.get('Last-Event-ID', UI_EVENTS.sequence))
+        if cursor < 0:
+            raise ValueError()
+    except ValueError:
+        abort(400)
+
+    def stream():
+        nonlocal cursor
+        yield 'event: connected\ndata: {}\n\n'
+        while True:
+            events = UI_EVENTS.wait(cursor)
+            if not events:
+                yield ': heartbeat\n\n'
+            for event in events:
+                cursor = event['id']
+                yield f"id: {cursor}\nevent: update\ndata: {json.dumps(event)}\n\n"
+    return Response(stream(), mimetype='text/event-stream',
+                    headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+
+@app.post('/api/mcp/events')
+def api_mcp_events():
+    require_mcp_service()
+    value = request.get_json()
+    if not isinstance(value, dict) or value.get('kind') != 'exports':
+        abort(400)
+    UI_EVENTS.publish('exports')
+    return jsonify(ok=True)
+
+
+@app.get('/api/mcp/viewer-snapshot')
+def api_mcp_viewer_snapshot():
+    require_mcp_service()
+    snapshot = UI_EVENTS.request_snapshot()
+    if snapshot is None:
+        return api_error('viewer_unavailable', 'No connected UI responded to the snapshot request.', 503)
+    return jsonify(snapshot)
+
+
+@app.post('/api/mcp/viewer-command')
+def api_mcp_viewer_command():
+    require_mcp_service()
+    value = request.get_json()
+    if (not isinstance(value, dict) or set(value) != {'job_id', 'action', 'frame'}
+            or not isinstance(value['job_id'], str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', value['job_id'])
+            or value['action'] not in ('seek', 'play', 'pause')
+            or (value['action'] == 'seek' and (type(value['frame']) is not int or value['frame'] < 0))
+            or (value['action'] != 'seek' and value['frame'] is not None)):
+        return api_error('invalid_playback_command', 'Invalid playback command.', 400)
+    result = UI_EVENTS.request_command(value)
+    if result is None:
+        return api_error('outcome_unknown', 'No UI acknowledged the command; inspect the viewer before retrying.', 504)
+    if 'error' in result:
+        return api_error('viewer_command_rejected', result['error'], 409)
+    return jsonify(result)
+
+
+@app.post('/api/ui/viewer-command/<token>/<operation>')
+def api_ui_viewer_command(token, operation):
+    check_character_library_request()
+    if not re.fullmatch(r'[0-9a-f]{32}', token):
+        abort(400)
+    if operation == 'claim':
+        accepted = UI_EVENTS.claim_command(token)
+    elif operation == 'reply':
+        value = request.get_json()
+        if not isinstance(value, dict):
+            abort(400)
+        accepted = UI_EVENTS.reply_command(token, value)
+    else:
+        abort(404)
+    if not accepted:
+        return api_error('viewer_command_expired', 'Command is already claimed or no longer pending.', 410)
+    return jsonify(ok=True)
+
+
+@app.post('/api/ui/viewer-snapshot/<token>')
+def api_ui_viewer_snapshot_reply(token):
+    if not local_model_request() or request.headers.get('Sec-Fetch-Site') == 'cross-site':
+        abort(403)
+    if request.content_length and request.content_length > 2 * 1024 * 1024:
+        abort(413)
+    snapshot = request.get_json()
+    if not isinstance(snapshot, dict) or not re.fullmatch(r'[0-9a-f]{32}', token):
+        abort(400)
+    if not UI_EVENTS.reply_snapshot(token, snapshot):
+        return api_error('snapshot_expired', 'Snapshot request is no longer pending.', 410)
+    return jsonify(ok=True)
+
+
+@app.route('/api/mcp/activity', methods=['GET', 'POST'])
+def api_mcp_activity():
+    if request.method == 'GET':
+        require_desktop_session()
+        directory = Path(REPO_ROOT) / '.cache/mcp/exports'
+        files = sorted(directory.glob('*.json'), key=lambda path: path.stat().st_mtime, reverse=True)[:20]
+        exports = [json.loads(path.read_text('utf-8')) for path in files]
+        for row in exports:
+            row.pop('temporary_path', None)
+        return jsonify(operations=MCP_ACTIVITY.snapshot(), exports=exports)
+    require_mcp_service()
+    value = request.get_json()
+    if (not isinstance(value, dict) or value.get('tool') not in TOOL_NAMES
+            or value.get('state') not in ('running', 'done', 'failed')):
+        abort(400)
+    try:
+        row = MCP_ACTIVITY.record(value)
+        UI_EVENTS.publish('activity')
+        if row['state'] == 'done' and row['tool'] in (
+                'flowhmr_import_character', 'flowhmr_select_character', 'flowhmr_update_character_pose'):
+            UI_EVENTS.publish('characters')
+        return jsonify(row)
+    except ValueError as error:
+        return api_error('mcp_activity_invalid', str(error), 400)
 
 # On Windows, Python's mimetypes resolves extensions through the registry, so a
 # machine whose HKCR\.js "Content Type" is text/plain makes every .js file we
@@ -105,6 +262,7 @@ ARGS = None
 JOBS = {}
 MEMBER_DIRS = {}
 JOBS_LOCK = threading.Lock()
+ENGINE_LOCK = threading.Lock()  # Worker lifetime and manual model unloading are mutually exclusive.
 FBX_EXPORT_LOCK = threading.Lock()
 BODY_PREVIEW_LOCK = threading.Lock()
 JOB_QUEUE = queue.Queue()
@@ -134,31 +292,45 @@ def checked_model_paths(args, body_reference=None):
         listing = "\n".join(missing)
         raise UserMessage("推理模型或配置未就绪。请在右上角「模型」查看：\n" + listing,
                           "model_files_not_ready", files=listing)
+    if RUNTIME.cuda_variant() == "cu121":
+        _check_cu121_weights(paths)
     return paths
 
 
-def load_engine(args, body_reference, paths):
+def _check_cu121_weights(paths):
+    # Official cu121 uses PyTorch 2.5.1, whose weights_only loader cannot
+    # safely open unknown files (CVE-2025-32434).
+    unverified = model_integrity.unverified_torch_weights(paths)
+    if unverified:
+        listing = "\n".join(unverified)
+        raise UserMessage("CUDA 12.1 只能使用已通过校验的官方权重。请在「模型」重新安装对应文件：\n" + listing,
+                          "runtime_cu121_model_unverified", files=listing)
+
+
+def resolve_inference_device(requested):
+    source = getattr(ARGS, "device_request", requested) if requested == getattr(ARGS, "device", None) else requested
+    try:
+        return resolve_device(plan_device(source, RUNTIME), RUNTIME)
+    except DeviceError as error:
+        raise UserMessage(str(error), error.code, **error.params) from error
+
+
+def load_engine(args, body_reference, paths, *, sam_backend="gpu"):
     """Validate and load the models from the job worker, never from startup or HTTP."""
     ckpt, model_cfg = paths[:2]
+    device = resolve_inference_device(args.device)
+    if sam_backend == "hybrid":
+        import torch
+        from flowhmr.utils.sam_cpu_backbone import cpu_backbone_supported
 
-    import torch
-
-    device = torch.device(args.device)
-    if device.type == "cuda":
-        runtime_rocm.configure_windows_hip(torch, attention=True)
-        if sys.platform == "win32" and torch.version.hip and device.index is None:
-            architecture = runtime_rocm.ARCH if RUNTIME.active == runtime_rocm.PROFILE else None
-            try:
-                args.device = f"cuda:{runtime_rocm.gpu_ordinal(torch, architecture)}"
-            except RuntimeError as error:
-                raise UserMessage("没有可用于当前 ROCm 环境的显卡。请检查驱动和显卡设置。", "runtime_rocm_gpu_required") from error
-            device = torch.device(args.device)
-        torch.cuda.set_device(device.index if device.index is not None else 0)
+        if device.type != "cuda" or not runtime_rocm.uses_shared_memory(torch, device) or not cpu_backbone_supported():
+            raise UserMessage("混合 SAM 需要 Windows AMD 核显和支持 AVX-512 BF16 的 CPU。", "sam_hybrid_unavailable")
     from flowhmr.pipeline.v2m_inference import V2MInferenceEngine
 
     return V2MInferenceEngine.build(
-        ckpt=str(ckpt), model_cfg_path=str(model_cfg), device=args.device,
+        ckpt=str(ckpt), model_cfg_path=str(model_cfg), device=str(device),
         smpl_model_path=str(paths[-2]), body_reference=body_reference,
+        sam_cpu_backbone=sam_backend == "hybrid",
     )
 
 
@@ -172,7 +344,7 @@ def missing_body_reference(reference):
                        "body_reference_missing", body=reference)
 
 
-def get_engine(job_id, requested_reference=None):
+def get_engine(job_id, requested_reference=None, *, sam_backend="gpu"):
     global ENGINE, _POSTPROCESS
     from flowhmr.core.bodymodels.smplh_data import validated_smplh_reference
 
@@ -185,18 +357,9 @@ def get_engine(job_id, requested_reference=None):
         raise UserMessage("尚未安装可用的 SMPL-H 体型。请导入官方 MANO v1.2 的男／女体型，或 Extended SMPL+H 的中性体型。",
                           "model_body_required") from error
     paths = checked_model_paths(ARGS, reference)
-    if ENGINE is None or ENGINE.body_reference != reference:
-        old = ENGINE
-        ENGINE = _POSTPROCESS = None
-        if old is not None:
-            stop = getattr(old.sam_extractor, "stop", None)
-            if stop is not None:
-                stop()
-            del old
-            cuda = getattr(sys.modules.get("torch"), "cuda", None)
-            if getattr(cuda, "is_initialized", lambda: False)():
-                cuda.empty_cache()
-        ENGINE = load_engine(ARGS, reference, paths)
+    if ENGINE is None or ENGINE.body_reference != reference or ENGINE.sam_backend != sam_backend:
+        release_engine()
+        ENGINE = load_engine(ARGS, reference, paths, sam_backend=sam_backend)
     with JOBS_LOCK:
         if job_id in CANCEL_REQUESTS:
             raise JobCancelled()
@@ -217,14 +380,22 @@ def get_postprocess(floor, preset, *, sole_fit_strength=0.0):
 
 
 # --------------------------------------------------------------------------- parameters
+# SAM hand-decoder sampling intervals exposed in the Settings card (1 = every frame).
+SAM_HAND_STRIDES = (1, 2, 4)
+
+
 # Defaults for the page's Settings card; everything is editable per run in the UI.
 DEFAULT_PARAMS = {
     "seed": 0, "cfg_scale": 1.0, "steps": 20, "max_frames": None, "vggt_interval": 0,
-    "sam_chunk_size": None, "start_frame": 0, "end_frame": None,
+    "sam_chunk_size": None, "sam_hand_stride": 1, "start_frame": 0, "end_frame": None,
+    "sam_backend": "gpu",
     "postprocess": True, "manual_select": True, "auto_frames": True, "static_camera": True,
+    "select_single_person": False,
+    "release_after_job": False,
     "correction_floor_m": None, "correction_preset": "strong",
     "sole_fit": True, "sole_fit_strength": SOLE_FIT_REFERENCE_STRENGTH,
     "smoothing_frames": 0.12, "hamer": False, "hamer_stride": 1,  # 0.04 on the 0–1 slider
+    "torso_opt": False,
 }
 
 
@@ -289,6 +460,15 @@ def parse_params(src, base=None):
     hamer_stride = integer("hamer_stride", 1)
     if hamer_stride not in HAMER_STRIDES:
         raise UserMessage("HaMeR 采样间隔须为 1、2、3 或 4 帧。", "param_hamer_stride")
+    sam_hand_stride = integer("sam_hand_stride", 1)
+    if sam_hand_stride not in SAM_HAND_STRIDES:
+        raise UserMessage("SAM 手部采样间隔须为逐帧、每 2 帧或每 4 帧。", "param_sam_hand_stride")
+    sam_backend = src.get("sam_backend", base["sam_backend"])
+    if sam_backend not in ("gpu", "hybrid"):
+        raise UserMessage("请选择有效的 SAM 运行模式。", "param_sam_backend")
+    if sam_backend == "hybrid" and (str(ARGS.device).split(":", 1)[0] != "cuda"
+                                    or not runtime_rocm.sam_hybrid_candidate(RUNTIME.active)):
+        raise UserMessage("混合 SAM 需要 Windows AMD 核显和支持 AVX-512 BF16 的 CPU。", "sam_hybrid_unavailable")
     try:
         smoothing = float(src.get("smoothing_frames", base["smoothing_frames"]))
     except (TypeError, ValueError, OverflowError):
@@ -324,17 +504,27 @@ def parse_params(src, base=None):
         "hamer_stride": hamer_stride,
         "vggt_interval": vggt_interval,
         "sam_chunk_size": integer("sam_chunk_size", 1, optional=True),
+        "sam_hand_stride": sam_hand_stride,
+        "sam_backend": sam_backend,
         "postprocess": _to_bool(src.get("postprocess"), base["postprocess"]),
         "correction_floor_m": floor,
         "correction_preset": preset,
         "sole_fit": sole_fit_strength > 0,
         "sole_fit_strength": sole_fit_strength,
         "manual_select": _to_bool(src.get("manual_select"), base.get("manual_select", True)),
+        "select_single_person": _to_bool(src.get("select_single_person"), base.get("select_single_person", False)),
         "static_camera": _to_bool(src.get("static_camera"), base["static_camera"] and vggt_interval == 0),
+        "release_after_job": _to_bool(src.get("release_after_job"), base["release_after_job"]),
+        "torso_opt": _to_bool(src.get("torso_opt"), base["torso_opt"]),
     }
 
 
 # --------------------------------------------------------------------------- jobs
+def job_detection_range(params):
+    legacy_limit = None if params.get("auto_frames", True) else params.get("max_frames")
+    return requested_frame_range(params.get("start_frame", 0), params.get("end_frame"), legacy_limit)
+
+
 def job_dir(job_id):
     return MEMBER_DIRS.get(job_id, os.path.join(ARGS.work_dir, job_id))
 
@@ -369,6 +559,8 @@ def _write_job(job, directory):
 
 def _persist_job_locked(job):
     _write_job(job, job_dir(job["id"]))
+    if job.get('ext') and os.path.isfile(os.path.join(job_dir(job['id']), f"input{job['ext']}")):
+        UI_EVENTS.publish('jobs', {'job_id': job.get('person_batch') or job['id']})
 
 
 def _legacy_job(job_id, directory):
@@ -492,6 +684,14 @@ def restore_jobs():
                 job.pop("scene", None)
                 if job.get("scene_state") in ACTIVE_STATUSES or job.get("scene_state") == "ready":
                     job["scene_state"] = "pending"
+        if job.get("source_kind") not in ("image", "video"):
+            try:
+                with open(os.path.join(entry.path, "mesh", "meta.json"), encoding="utf-8") as file:
+                    source_meta = json.load(file)
+                if isinstance(source_meta, dict) and source_meta.get("source_kind") in ("image", "video"):
+                    job.update({key: source_meta[key] for key in ("source_kind", "source_name") if source_meta.get(key)})
+            except (OSError, ValueError):
+                pass
         with JOBS_LOCK:
             JOBS[job["id"]] = job
             _persist_job_locked(job)
@@ -502,6 +702,7 @@ def _build_job(filename, params, ext):
     job = {
         "id": job_id, "filename": filename, "params": params, "ext": ext, "recovered": False,
         "status": "queued", "message": "Waiting in queue", "error": None, "progress": 0,
+        "source": "desktop", "selection_policy": "legacy",
         "created": time.time(), "started": None, "finished": None,
         "num_frames": None, "fps": 30, "has_fbx": False,
         "candidates": None, "default_person": None, "selected_person": None, "selection_auto": False,
@@ -515,8 +716,9 @@ def _build_job(filename, params, ext):
     return job
 
 
-def new_job(filename, params, ext):
+def new_job(filename, params, ext, **metadata):
     job = _build_job(filename, params, ext)
+    job.update(metadata)
     os.makedirs(job_dir(job["id"]), exist_ok=True)
     with JOBS_LOCK:
         JOBS[job["id"]] = job
@@ -536,17 +738,21 @@ def input_video(job_id):
 
 def enqueue(job):
     JOB_QUEUE.put(job["id"])
+    UI_EVENTS.publish('jobs', {'job_id': job.get('person_batch') or job['id']})
 
 
 def worker_loop():
+    global ENGINE, _POSTPROCESS
     while True:
         job_id = JOB_QUEUE.get()
         if isinstance(job_id, tuple):
             try:
-                _assemble_scene(job_id[1], automatic=False)
+                with ENGINE_LOCK:
+                    _assemble_scene(job_id[1], automatic=False)
             finally:
                 JOB_QUEUE.task_done()
             continue
+        ENGINE_LOCK.acquire()
         try:
             run_job(job_id)
         except JobCancelled:
@@ -568,7 +774,20 @@ def worker_loop():
                     if s["status"] == "running":
                         s["status"] = "cancelled" if cancelled else "failed"
                 detail = f"{type(e).__name__}: {e}"
-                code, params = (e.code, e.params) if isinstance(e, UserMessage) else ("job_failed", {"detail": detail})
+                if isinstance(e, UserMessage):
+                    code, params = e.code, e.params
+                elif isinstance(e, EmptyPersonRangeError):
+                    code, params = "detection_empty_range", {}
+                elif isinstance(e, SharedCameraSamplingError):
+                    code, params = "rocm_camera_sampling", {}
+                elif isinstance(e, SAMMemoryError):
+                    code, params = f"sam_low_{e.resource}", {}
+                elif isinstance(e, SharedGPUMemoryError):
+                    code, params = "rocm_shared_ram_low", e.params
+                elif isinstance(e, InferenceRAMError):
+                    code, params = "inference_ram_low", e.params
+                else:
+                    code, params = "job_failed", {"detail": detail}
                 job.update(status="cancelled" if cancelled else "failed",
                            error=None if cancelled else detail, error_code=None if cancelled else code,
                            error_params={} if cancelled else params,
@@ -581,6 +800,12 @@ def worker_loop():
                 CANCEL_REQUESTS.discard(job_id)
                 batch = JOBS.get(job_id, {}).get("person_batch")
             try:
+                if ENGINE is not None:
+                    try:
+                        ENGINE.release_stage()
+                    except Exception:
+                        app.logger.exception("Unable to park the active inference model; discarding the engine")
+                        ENGINE = _POSTPROCESS = None
                 cuda = getattr(sys.modules.get("torch"), "cuda", None)
                 if getattr(cuda, "is_initialized", lambda: False)():
                     cuda.empty_cache()
@@ -589,7 +814,14 @@ def worker_loop():
             except RuntimeError:
                 traceback.print_exc()
             finally:
-                JOB_QUEUE.task_done()
+                try:
+                    if JOBS.get(job_id, {}).get("params", {}).get("release_after_job"):
+                        release_engine()
+                except Exception:
+                    traceback.print_exc()
+                finally:
+                    ENGINE_LOCK.release()
+                    JOB_QUEUE.task_done()
 
 
 def _raise_if_cancelled(job_id):
@@ -651,6 +883,10 @@ def _confirm_people(job_id, result, candidates, people, *, automatic):
             candidate = candidates[i]
             child = _build_job(filename, params.copy(), ext)
             child.update(_selected_track(candidate), person_batch=job_id,
+                         source_kind=parent.get("source_kind", "image" if is_image_job(parent) else "video"),
+                         source_name=parent.get("source_name", filename),
+                         source=parent.get('source', 'desktop'),
+                         selection_policy=parent.get('selection_policy', 'legacy'),
                          video_size=[result.width, result.height], source_frames=result.total_frames,
                          body_reference=reference)
             child_stage = os.path.join(staging, child["id"])
@@ -659,8 +895,8 @@ def _confirm_people(job_id, result, candidates, people, *, automatic):
             _link_video(os.path.join(directory, video), os.path.join(child_stage, video))
             _link_video(os.path.join(directory, canonical), os.path.join(child_stage, canonical))
             _copy_person_thumbnail(directory, child_stage, i)
-            bbox, start_end = VideoProcessor.track_bboxes(result, candidate["track_index"])
-            np.savez(os.path.join(sub_dir, f"{SUB}_bbox.npz"), bbox=bbox, start_end=start_end)
+            VideoProcessor.save_detected_track(os.path.join(sub_dir, f"{SUB}_bbox.npz"), result,
+                                                candidate["track_index"], job_detection_range(params))
             _write_job(child, child_stage)
             children.append((child, child_stage))
 
@@ -763,18 +999,26 @@ def _assemble_scene(batch, *, automatic):
         check()
         update_job(batch, scene_message=message)
 
-    own_extractor = None
+    @contextmanager
+    def load_scene_sam():
+        from flowhmr.utils.runtime_sam_features import build_sam3d_extractor
+
+        notify("正在加载站位估计模型…")
+        with closing(build_sam3d_extractor(device, xpu_backbone_device=xpu_backbone)) as extractor:
+            yield extractor
+
     try:
+        import torch
         from flowhmr.utils.runtime_group_scene import build_group_scene
 
-        if ENGINE is None:
-            from flowhmr.utils.runtime_sam_features import build_sam3d_extractor
-            import torch
-
-            notify("正在加载站位估计模型…")
-            own_extractor = build_sam3d_extractor(torch.device(ARGS.device))
-        extractor = ENGINE.sam_extractor if ENGINE is not None else own_extractor
-        scene = build_group_scene(Path(job_dir(batch)) / "scene", done, INSPECTION, extractor, ARGS.device,
+        if RUNTIME.cuda_variant() == "cu121":
+            _check_cu121_weights(tuple(map(resolve_model, (*SAM3D_FILES, VGGT))))
+        device = ENGINE.device if ENGINE is not None else resolve_inference_device(ARGS.device)
+        xpu_backbone = device if device.type == "xpu" else None
+        if xpu_backbone is not None:
+            device = torch.device("cpu")  # VGGT and scene geometry run on the host.
+        acquire_sam = ENGINE.scene_sam if ENGINE is not None else load_scene_sam
+        scene = build_group_scene(Path(job_dir(batch)) / "scene", done, INSPECTION, acquire_sam, device,
                                   check=check, notify=notify)
         update_job(batch, scene=scene, scene_state="ready", scene_error=None, scene_finished=time.time())
         print(f"  [scene] {batch}: {len(scene['people'])} aligned people, source frames {scene['track_start'] + 1}–{scene['track_end'] + 1}", flush=True)
@@ -783,25 +1027,107 @@ def _assemble_scene(batch, *, automatic):
     except Exception as exc:
         update_job(batch, scene_state="failed", scene_error=f"多人场景对齐失败：{exc}", scene_error_detail=str(exc))
         traceback.print_exc()
+
+
+def run_torso_optimization(job_id, engine, params, sub_dir, result, standard_motion):
+    """Re-run generation with the optional base checkpoint, then compose torso motion.
+
+    The second pass reuses the cached detection, camera and SAM features of this
+    job, so it only repeats model loading, generation and the configured
+    postprocess. The base torso local rotations are kept, while the standard
+    result's world-space ankles and foot orientation are restored by leg IK.
+    """
+    from flowhmr.pipeline.v2m_inference import StageName, build_pipeline, load_yaml
+    from flowhmr.utils.runtime_torso_optimization import compose_torso_optimization, save_composed_motion
+
+    base_ckpt, base_cfg = flowhmr_base_paths()
+    base_suffix = "" if params["postprocess"] else "_origin"
+    base_result = os.path.join(sub_dir, f"{SUB}_seed{params['seed']}{base_suffix}")
+    latest_report = getattr(engine.postprocess, "last_report", None) if engine.postprocess is not None else None
+    latest_pipeline = engine.pipeline
+    staged = getattr(engine, "_staged_models", None) or {}
+    staged_generation = staged.get(StageName.GENERATION)
+    base_pipeline = None
+    try:
+        if staged:
+            # Low-VRAM mode keeps the generation network on the CPU between stages;
+            # register the base network in the same slot so activation still works.
+            engine._activate_stage()
+        base_pipeline = build_pipeline(
+            load_yaml(str(base_cfg)), device="cpu" if staged else str(engine.device), ckpt=str(base_ckpt),
+            validation_steps=params["steps"], smpl_model_path=str(engine.smpl_model_path))
+        engine.pipeline = base_pipeline
+        if staged:
+            staged[StageName.GENERATION] = (base_pipeline, None)
+            engine._active_stage = None
+        engine.process_video(
+            input_video(job_id), job_dir(job_id), seed=params["seed"], cfg_scale=params["cfg_scale"],
+            max_frames=None if params["auto_frames"] else params["max_frames"],
+            start_frame=params["start_frame"], end_frame=params["end_frame"],
+            smoothing_frames=params["smoothing_frames"], hamer=False, hamer_stride=1,
+            vggt_frame_interval=params["vggt_interval"],
+            static_camera=params.get("static_camera", False),
+            sam_chunk_size=params.get("sam_chunk_size", DEFAULT_PARAMS["sam_chunk_size"]),
+            sam_hand_stride=params["sam_hand_stride"],
+            person_selector=None, progress_callback=None,
+            cancel_check=lambda: _raise_if_cancelled(job_id))
+        _raise_if_cancelled(job_id)
+        if not os.path.exists(base_result + ".npz"):
+            raise FileNotFoundError(f"torso base output missing: {base_result}.npz")
+        with np.load(base_result + ".npz", allow_pickle=True) as base_data:
+            base_motion = {key: np.array(base_data[key], copy=True) for key in base_data.files}
     finally:
-        if own_extractor is not None:
-            own_extractor.close()
+        engine.pipeline = latest_pipeline
+        if latest_report is not None:
+            engine.postprocess.last_report = latest_report
+        if staged and staged_generation is not None:
+            staged[StageName.GENERATION] = staged_generation
+            engine._active_stage = None
+            try:
+                engine._activate_stage()
+            except Exception:  # Park whatever is resident; the next job can reactivate.
+                pass
+        if base_pipeline is not None:
+            del base_pipeline
+            import gc
+            gc.collect()
+            cuda = getattr(sys.modules.get("torch"), "cuda", None)
+            if getattr(cuda, "is_initialized", lambda: False)():
+                cuda.empty_cache()
+    composed, metrics = compose_torso_optimization(
+        base_motion, standard_motion, engine.smpl_model_path, body_reference=engine.body_reference)
+    save_composed_motion(composed, result, engine.smpl_model_path)
+    return metrics
 
 
 def run_job(job_id):
     _raise_if_cancelled(job_id)
+    if get_job(job_id).get("pose_edit"):
+        return run_pose_edit(job_id)
     with JOBS_LOCK:
         job = JOBS[job_id]
         params = job["params"]
+        sam_backend = params.get("sam_backend", "gpu")
         requested_reference = job.get("body_reference")
         if not isinstance(requested_reference, str) or requested_reference not in SMPLH_FILES:
             requested_reference = None
         if params["hamer"] and not hamer_available(ARGS.device):
+            if str(ARGS.device).split(":", 1)[0] in ("cpu", "xpu"):
+                raise UserMessage(HAMER_ISSUES["hamer_gpu_required"], "hamer_gpu_required")
             raise UserMessage(MISSING_HAMER, "hamer_not_ready")
-        loading_models = ENGINE is None or ENGINE.body_reference != (requested_reference or smplh_reference())
+        if params.get("torso_opt") and not torso_optimization_available():
+            raise UserMessage("请先在右上角「模型」下载可选的 FlowHMR 躯干模型（base），再开启躯干动作优化。",
+                              "torso_model_missing")
+        loading_models = (ENGINE is None or ENGINE.body_reference != (requested_reference or smplh_reference())
+                          or ENGINE.sam_backend != sam_backend)
         job.update(status="running", loading_models=loading_models, started=time.time(),
                    message="首次运行，正在加载推理模型…" if loading_models else "Starting")
         _persist_job_locked(job)
+
+    if params["hamer"] and RUNTIME.cuda_variant() == "cu121":
+        _check_cu121_weights(tuple(map(resolve_model, HAMER_FILES)))
+    if params.get("torso_opt") and RUNTIME.cuda_variant() == "cu121":
+        _check_cu121_weights(tuple(map(resolve_model, FLOWHMR_BASE_FILES)))
 
     def on_progress(stage, progress, desc):
         idx = STAGE_INDEX.get(getattr(stage, "value", str(stage)))
@@ -833,7 +1159,10 @@ def run_job(job_id):
 
     def select_person(result, candidates, default_idx):
         """Pause for one or more choices; continue this single-person pipeline on the first."""
-        slot = {"event": threading.Event(), "people": None}
+        slot = {"event": threading.Event(), "people": None, "box_edits": []}
+        static_image = is_image_job(JOBS[job_id])
+        for candidate in candidates:
+            candidate["static_image"] = static_image
         try:
             save_person_thumbnails(job_id, candidates)
         except Exception:  # thumbnails are only a UI aid
@@ -861,11 +1190,16 @@ def run_job(job_id):
                 )
                 stage["status"] = "running"
                 SELECTIONS.pop(job_id, None)
+        _raise_if_cancelled(job_id)
+        if people is None and JOBS[job_id].get('selection_policy') == 'explicit':
+            raise UserMessage('等待人物选择已超时，请重跑任务并重新选择。', 'selection_timeout')
         chosen = people or [default_idx]
+        if slot["box_edits"]:
+            apply_to_tracks(result, candidates, slot["box_edits"])
         _confirm_people(job_id, result, candidates, chosen, automatic=people is None)
         return chosen[0]
 
-    engine = get_engine(job_id, requested_reference)
+    engine = get_engine(job_id, requested_reference, sam_backend=sam_backend)
     _raise_if_cancelled(job_id)
     engine.pipeline.validation_steps = params["steps"]
     engine.postprocess = None
@@ -882,8 +1216,11 @@ def run_job(job_id):
         hamer_stride=params["hamer_stride"],
         vggt_frame_interval=params["vggt_interval"],
         static_camera=params.get("static_camera", False),
+        source_image=is_image_job(JOBS[job_id]),
         sam_chunk_size=params.get("sam_chunk_size", DEFAULT_PARAMS["sam_chunk_size"]),
+        sam_hand_stride=params["sam_hand_stride"],
         person_selector=select_person if params.get("manual_select", True) else None,
+        select_single_person=params.get("select_single_person", False),
         progress_callback=on_progress,
         cancel_check=lambda: _raise_if_cancelled(job_id),
         details_callback=lambda details: update_job(job_id, **details),
@@ -893,6 +1230,19 @@ def run_job(job_id):
     result = os.path.join(sub_dir, f"{SUB}_seed{params['seed']}{final_suffix}")
     if not os.path.exists(result + ".npz"):
         raise FileNotFoundError(f"generation output missing: {result}.npz")
+
+    if params.get("torso_opt"):
+        _raise_if_cancelled(job_id)
+        update_job(job_id, message="正在生成躯干优化动作（base 检查点）")
+        correction_report = getattr(engine.postprocess, "last_report", None) if params["postprocess"] else None
+        # The standard result is the source of truth for feet, shape and root motion.
+        with np.load(result + ".npz", allow_pickle=True) as standard:
+            standard_motion = {key: np.array(standard[key], copy=True) for key in standard.files}
+        torso = run_torso_optimization(job_id, engine, params, sub_dir, result, standard_motion)
+        if correction_report is not None:
+            engine.postprocess.last_report = correction_report
+        update_job(job_id, torso_opt=torso)
+        _raise_if_cancelled(job_id)
 
     update_job(job_id, message="Building 3D mesh")
     out_root = job_dir(job_id)
@@ -906,7 +1256,9 @@ def run_job(job_id):
         with np.load(bbox_npz, allow_pickle=False) as bbox:
             start = int(bbox["start_end"][0])
     meta.update({"track_start": start, "track_end": start + meta["num_frames"] - 1,
-                 "body_reference": engine.body_reference})
+                 "body_reference": engine.body_reference,
+                 "source_kind": "image" if is_image_job(JOBS[job_id]) else "video",
+                 "source_name": JOBS[job_id].get("source_name", JOBS[job_id]["filename"])})
     with open(os.path.join(out_root, "mesh", "meta.json"), "w") as f:
         json.dump(meta, f)
 
@@ -972,7 +1324,7 @@ def save_person_thumbnails(job_id, candidates):
 
 
 # --------------------------------------------------------------------------- mesh export
-def export_mesh_sequence(motion_npz, out_dir, cancel_check=lambda: None):
+def export_mesh_sequence(motion_npz, out_dir, cancel_check=lambda: None, *, mesh_model=None):
     """Run SMPL-H forward on the generated motion and write a float16 vertex stream.
 
     No ground alignment: Y=0 is the floor and the model's root height is shown
@@ -981,14 +1333,14 @@ def export_mesh_sequence(motion_npz, out_dir, cancel_check=lambda: None):
     import torch
 
     os.makedirs(out_dir, exist_ok=True)
-    data = np.load(motion_npz, allow_pickle=True)
-    poses = torch.from_numpy(np.asarray(data["poses"], dtype=np.float32))
-    trans = torch.from_numpy(np.asarray(data["trans"], dtype=np.float32))
-    betas = torch.from_numpy(np.asarray(data["betas"], dtype=np.float32)).reshape(1, -1)
+    with np.load(motion_npz, allow_pickle=False) as data:
+        poses = torch.from_numpy(np.asarray(data["poses"], dtype=np.float32))
+        trans = torch.from_numpy(np.asarray(data["trans"], dtype=np.float32))
+        betas = torch.from_numpy(np.asarray(data["betas"], dtype=np.float32)).reshape(1, -1)
     T = poses.shape[0]
     poses = poses.reshape(T, -1, 3)
 
-    mesh_model = ENGINE.smpl_mesh
+    mesh_model = mesh_model if mesh_model is not None else ENGINE.smpl_mesh
     dev = mesh_model.v_template.device
     betas = betas[:, :mesh_model.shapedirs.shape[-1]].to(dev)
 
@@ -1062,14 +1414,327 @@ def api_error(error_code, message, status, **params):
     return jsonify(error=message, error_code=error_code, error_params=params), status
 
 
+@app.get('/api/mcp/parameters')
+def api_mcp_parameters():
+    require_mcp_service()
+    return jsonify(parameters=MCPParameters.model_json_schema(), defaults=parameter_defaults(default_params()),
+                   export_options=MCPExportOptions.model_json_schema(),
+                   frame_timeline='Zero-based normalized 30 FPS video; end_frame is inclusive.',
+                   parameter_application='Import uses defaults; rerun inherits omitted parameters and creates a new job.')
+
+
+def submission_metadata(values, params):
+    if values.get('source') != 'mcp':
+        return {'source': 'desktop', 'selection_policy': 'legacy'}
+    require_mcp_service(max_bytes=None)
+    policy = values.get('selection_policy', 'explicit')
+    if policy not in ('explicit', 'automatic'):
+        raise UserMessage('Invalid selection policy.', 'param_selection_policy')
+    params['manual_select'] = policy == 'explicit'
+    params['select_single_person'] = policy == 'explicit'
+    return {'source': 'mcp', 'selection_policy': policy}
+
+
+@app.route('/api/mcp', methods=['GET', 'POST'])
+def api_mcp():
+    require_desktop_session()
+    try:
+        if request.method == 'GET':
+            return jsonify(MCP_SERVICE.snapshot())
+        body = request.get_json()
+        if not isinstance(body, dict):
+            raise ValueError('Expected a JSON object.')
+        action = body.get('action')
+        if set(body) - {'action', 'port', 'auth_enabled', 'auto_start'}:
+            raise ValueError('Unknown MCP configuration field.')
+        if action == 'start':
+            return jsonify(MCP_SERVICE.start(body.get('port'), f'http://127.0.0.1:{ARGS.port}'))
+        if action == 'stop':
+            MCP_SERVICE.stop()
+            return jsonify(MCP_SERVICE.snapshot())
+        if action == 'reset_token':
+            return jsonify(MCP_SERVICE.reset_token())
+        if action == 'configure_auth':
+            return jsonify(MCP_SERVICE.configure_auth(body.get('auth_enabled')))
+        if action == 'configure_auto_start':
+            return jsonify(MCP_SERVICE.configure_auto_start(body.get('auto_start')))
+        if action == 'test':
+            return jsonify(MCP_SERVICE.test_connection())
+        raise ValueError('Unknown MCP action.')
+    except Exception as error:
+        app.logger.exception('MCP management failed')
+        return api_error('mcp_failed', str(error), 400)
+
+
 CHARACTER_FILES = CharacterFiles()
 CHARACTER_LIBRARY = CharacterLibrary(MODEL_ROOT / "characters")
+POSE_PRESETS = PosePresets(Path(REPO_ROOT) / "output" / "pose_presets")
 
 
-def check_character_library_request():
+@app.route("/api/pose-presets", methods=["GET", "POST"])
+def api_pose_presets():
+    check_character_library_request()
+    if request.method in ("GET", "HEAD"):
+        return jsonify(items=POSE_PRESETS.list(), directory=str(POSE_PRESETS.root.resolve()))
+    value = request.get_json(silent=True)
+    if not isinstance(value, dict):
+        abort(400)
+    try:
+        if "preset" in value:
+            preset = value["preset"]
+        else:
+            with JOBS_LOCK:
+                identifier = value.get("job_id")
+                if not isinstance(identifier, str) or identifier not in JOBS:
+                    abort(404)
+                job = copy.deepcopy(JOBS[identifier])
+                if job["status"] != "done":
+                    abort(409)
+                preset = capture_preset(Path(job_dir(job["id"])) / "motion.npz",
+                                        value.get("name"), value.get("part"), value.get("frame"))
+        return jsonify(POSE_PRESETS.save(preset)), 201
+    except (ValueError, KeyError, TypeError):
+        return api_error("pose_preset_invalid", "预设内容、名称、部位或帧号无效。", 400)
+    except OSError:
+        return api_error("pose_preset_io", "无法读写本地姿势预设。", 500)
+
+
+@app.route("/api/pose-presets/<identifier>", methods=["GET", "DELETE"])
+def api_pose_preset(identifier):
+    check_character_library_request()
+    try:
+        if request.method == "DELETE":
+            POSE_PRESETS.delete(identifier)
+            return jsonify(ok=True)
+        response = jsonify(POSE_PRESETS.get(identifier))
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except (FileNotFoundError, ValueError):
+        return api_error("pose_preset_missing", "此预设已不存在，请刷新列表。", 404)
+
+
+@app.post("/api/jobs/<job_id>/pose-presets")
+def api_apply_pose_preset(job_id):
+    check_character_library_request()
+    value = request.get_json(silent=True)
+    if not isinstance(value, dict):
+        abort(400)
+    try:
+        preset = POSE_PRESETS.get(value.get("preset_id"))
+        with JOBS_LOCK:
+            if job_id not in JOBS:
+                abort(404)
+            source = copy.deepcopy(JOBS[job_id])
+            if source["status"] != "done":
+                abort(409)
+            directory = Path(job_dir(job_id))
+            data = read_motion(directory / "motion.npz")
+            data = apply_preset(data, preset, value.get("start"), value.get("end"),
+                                value.get("strength", 1.0), value.get("blend_frames", 5))
+            # Build a complete independent input before publishing the queued job.
+            job = _build_job(source["filename"], copy.deepcopy(source["params"]), source["ext"])
+            label = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", preset["name"])
+            job["filename"] = f"{Path(source['filename']).stem} · {label}{source['ext']}"
+            job.update(body_reference=job_body_reference(source), selected_person=source.get("selected_person"),
+                       source_kind="image" if is_image_job(source) else "video", source_name=source.get("source_name", source["filename"]),
+                       selection_auto=source.get("selection_auto", False),
+                       pose_edit={"source_job": job_id, "preset": preset["name"], "part": preset["part"],
+                                  "start": value["start"], "end": value["end"]},
+                       stages=[{"name": "pose_edit", "label": "Pose preset", "detail": preset["name"],
+                                "status": "pending", "progress": 0, "start": None, "end": None}])
+            Path(ARGS.work_dir).mkdir(parents=True, exist_ok=True)
+            destination = Path(job_dir(job["id"]))
+            with tempfile.TemporaryDirectory(prefix=".pose-edit-", dir=ARGS.work_dir) as temporary:
+                staging = Path(temporary) / "result"
+                (staging / SUB).mkdir(parents=True)
+                _link_video(directory / f"input{source['ext']}", staging / f"input{source['ext']}")
+                canonical = directory / SUB / f"{SUB}_30fps.mp4"
+                if canonical.is_file():
+                    _link_video(canonical, staging / SUB / canonical.name)
+                boxes = directory / SUB / f"{SUB}_bbox.npz"
+                if boxes.is_file():
+                    shutil.copy2(boxes, staging / SUB / boxes.name)
+                if source.get("selected_person") is not None:
+                    _copy_person_thumbnail(directory, staging, source["selected_person"])
+                np.savez_compressed(staging / "motion.npz", **data)
+                shutil.copy2(directory / "mesh" / "meta.json", staging / "source-meta.json")
+                _write_job(job, staging)
+                os.rename(staging, destination)
+            JOBS[job["id"]] = job
+        enqueue(job)
+        return jsonify(job_id=job["id"]), 202
+    except (FileNotFoundError, ValueError, KeyError, TypeError):
+        return api_error("pose_preset_invalid", "预设内容、名称、部位或帧号无效。", 400)
+    except OSError:
+        app.logger.exception("Could not prepare the pose preset edit")
+        return api_error("pose_preset_io", "无法读写本地姿势预设。", 500)
+
+
+def run_pose_edit(job_id):
+    """Rebuild only SMPL-H geometry on the CPU; no inference models or CUDA needed."""
+    from flowhmr.core.bodymodels.smpl_skeleton import SMPLMesh
+
+    job = get_job(job_id)
+    root = Path(job_dir(job_id))
+    now = time.time()
+    stages = copy.deepcopy(job["stages"])
+    stages[0].update(status="running", start=now, progress=10)
+    update_job(job_id, status="running", started=now, loading_models=False, progress=10,
+               message="Applying pose preset", message_code="pose_edit", stages=stages)
+    previous = json.loads((root / "source-meta.json").read_text(encoding="utf-8"))
+    model = SMPLMesh(model_path=str(model_path(job_body_reference(job)))).cpu().eval()
+    meta = export_mesh_sequence(root / "motion.npz", root / "mesh",
+                                cancel_check=lambda: _raise_if_cancelled(job_id), mesh_model=model)
+    meta.update({key: previous[key] for key in ("track_start", "track_end", "body_reference", "fps")
+                 if key in previous})
+    _raise_if_cancelled(job_id)
+    (root / "mesh" / "meta.json").write_text(json.dumps(meta, allow_nan=False), encoding="utf-8")
+    stages[0].update(status="completed", end=time.time(), progress=100)
+    with JOBS_LOCK:
+        if job_id in CANCEL_REQUESTS:
+            raise JobCancelled()
+        JOBS[job_id].update(status="done", finished=time.time(), progress=100, message="Done",
+                            message_code=None, num_frames=meta["num_frames"], has_fbx=False, stages=stages)
+        _persist_job_locked(JOBS[job_id])
+
+
+def mcp_character_actor(job_id, person_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            abort(404)
+        members = _batch_members_locked(job_id)
+        if len(members) > 1:
+            if type(person_id) is not int:
+                raise ValueError('Multi-person scenes require person_id from flowhmr_get_job')
+            matches = [member for member in members if member.get('selected_person') == person_id - 1]
+            if not matches:
+                raise ValueError('Unknown scene person_id')
+            actor = matches[0]
+            slot = str(person_id)
+        else:
+            actor, slot = job, 'single'
+            if person_id is not None and (type(person_id) is not int or person_id != single_result_person_id(job)):
+                raise ValueError('Unknown result person_id')
+        if actor['status'] != 'done':
+            raise ValueError('Character settings require a completed actor result')
+        return actor['id'], slot
+
+
+@app.get('/api/mcp/jobs/<job_id>/keyframes')
+def api_mcp_motion_keyframes(job_id):
+    require_mcp_service()
+    try:
+        person = request.args.get('person', type=int)
+        start = request.args.get('start_frame', default=0, type=int)
+        count = request.args.get('count', default=1, type=int)
+        if (('person' in request.args and person is None) or start is None or count is None
+                or start < 0 or not 1 <= count <= 120):
+            raise ValueError('Invalid person, start_frame or count')
+        actor, _ = mcp_character_actor(job_id, person)
+        from flowhmr.mcp.joint_names import SMPLH_JOINT_NAMES_52
+        with np.load(os.path.join(job_dir(actor), 'motion.npz'), allow_pickle=False) as motion:
+            poses = np.asarray(motion['poses'])
+            trans = np.asarray(motion['trans'])
+            if poses.ndim == 2 and poses.shape[1] == 156:
+                poses = poses.reshape(-1, 52, 3)
+            if poses.ndim != 3 or poses.shape[1:] != (52, 3) or trans.shape != (len(poses), 3):
+                raise ValueError('Unsupported source motion shape')
+            if start >= len(poses) or start + count > len(poses):
+                raise ValueError('Requested frame range exceeds motion length')
+            fps = float(np.asarray(motion['mocap_framerate']).item())
+            frames = [{'frame': i, 'time_seconds': i / fps, 'root_translation': trans[i].tolist(),
+                       'rotations_axis_angle': poses[i].tolist()} for i in range(start, start + count)]
+        return jsonify(job_id=job_id, actor_id=actor, person_id=person, frame_count=len(poses), fps=fps,
+                       skeleton='SMPL-H', joints=[{'index': i, 'name': name} for i, name in enumerate(SMPLH_JOINT_NAMES_52)],
+                       rotation_units='radians, axis-angle; local joint rotations', translation_units='metres',
+                       keyframe_type='dense source motion samples', frames=frames)
+    except (ValueError, KeyError, OSError) as error:
+        return api_error('motion_keyframes_invalid', str(error), 400)
+
+
+@app.post('/api/mcp/characters/import')
+def api_mcp_import_character():
+    require_mcp_service()
+    value = request.get_json()
+    if not isinstance(value, dict) or set(value) - {'file', 'name'}:
+        abort(400)
+    try:
+        return jsonify(import_character(CHARACTER_LIBRARY, CHARACTER_FILES, value.get('file'), value.get('name')))
+    except (OSError, ValueError, RuntimeError) as error:
+        return api_error('character_import_failed', str(error), 400)
+
+
+@app.route('/api/mcp/jobs/<job_id>/character', methods=['GET', 'POST', 'PATCH'])
+def api_mcp_character(job_id):
+    require_mcp_service()
+    try:
+        value = request.get_json() if request.method != 'GET' else {}
+        if not isinstance(value, dict):
+            raise ValueError('Expected an object')
+        person = request.args.get('person', type=int) if request.method == 'GET' else value.get('person_id')
+        if request.method == 'GET' and 'person' in request.args and person is None:
+            raise ValueError('person must be an integer')
+        actor, slot = mcp_character_actor(job_id, person)
+        catalog = CHARACTER_LIBRARY.snapshot([actor])
+        if request.method == 'POST':
+            if set(value) - {'person_id', 'character_id'} or 'character_id' not in value:
+                raise ValueError('Expected character_id and optional person_id')
+            identifier = value['character_id']
+            models = {item['id']: item for item in catalog['models']}
+            if identifier is not None and identifier not in models:
+                raise ValueError('Character is not in the library')
+            saved = catalog['actors'].get(actor, {}).get('poses', {}).get(identifier)
+            pose = saved if saved is not None else catalog['presets'].get(identifier)
+            if pose is None:
+                pose = empty_pose(models[identifier]['kind']) if identifier else None
+            CHARACTER_LIBRARY.set_actor(actor, slot, identifier, pose, select=True)
+        elif request.method == 'PATCH':
+            if set(value) - {'person_id', 'character_id', 'patch'}:
+                raise ValueError('Unknown pose setting')
+            patch = PosePatch.model_validate(value.get('patch'))
+            character_id = value.get('character_id')
+            kind = next((item['kind'] for item in catalog['models'] if item['id'] == character_id), None)
+
+            def apply_patch(current):
+                if patch.ik_mode == 'ik' and not can_request_ik(kind, current):
+                    raise ValueError('IK requires a PMX rig with native IK or a character with saved IK controllers')
+                return patch.patch(current)
+
+            CHARACTER_LIBRARY.update_pose(actor, slot, character_id, apply_patch)
+        catalog = CHARACTER_LIBRARY.snapshot([actor])
+        record = catalog['actors'].get(actor)
+        inherited = record is None
+        if inherited:
+            default = catalog['defaults'].get(slot, {})
+            record = {'id': default.get('id'), 'poses': {default.get('id'): default.get('offsets')}}
+        identifier = record.get('id')
+        return jsonify(actor_id=actor, person_id=person, character_id=identifier,
+            assignment_source='default' if inherited and identifier else 'actor' if not inherited else 'none',
+            pose=record.get('poses', {}).get(identifier), bones=BONES,
+            patch_schema=PosePatch.model_json_schema(),
+            scope='Preview offsets only; original motion and generic MCP exports remain unchanged.',
+            rotation_units='degrees; XYZ in the retarget rig bind axes', translation_units='metres',
+            finger_controls='22-36 are shared hand controls, not raw target bone indices',
+            mirror='Editor preference only; provide both body joint rotations to edit both sides.')
+    except (OSError, ValueError, RuntimeError) as error:
+        return api_error('character_settings_failed', str(error), 400)
+
+
+def check_character_library_request(max_bytes=16384):
     if not local_model_request() or request.headers.get("Sec-Fetch-Site") == "cross-site":
         abort(403)
-    if request.content_length and request.content_length > 16384:
+    if request.content_length is not None and request.content_length > max_bytes:
+        abort(413)
+
+
+def require_mcp_service(max_bytes=16384):
+    if not local_model_request() or request.headers.get('Sec-Fetch-Site') == 'cross-site':
+        abort(403)
+    supplied = request.headers.get(SERVICE_KEY_HEADER, '')
+    if not supplied.isascii() or not hmac.compare_digest(supplied, MCP_SERVICE.service_key):
+        abort(403)
+    if max_bytes is not None and request.content_length and request.content_length > max_bytes:
         abort(413)
 
 
@@ -1090,6 +1755,33 @@ def api_character_library():
         return api_error("character_library_read", "无法读取本地角色库。", 500)
 
 
+def _character_thumbnail_response(read, write, identifier):
+    check_character_library_request(THUMBNAIL_BYTES)
+    try:
+        if request.method in ("GET", "HEAD"):
+            response = Response(read(identifier), mimetype="image/png")
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            return response
+        if request.mimetype != "image/png":
+            abort(415)
+        # Read at most one byte past the cap, including chunked requests.
+        data = request.stream.read(THUMBNAIL_BYTES + 1)
+        if len(data) > THUMBNAIL_BYTES:
+            abort(413)
+        write(identifier, data)
+        return jsonify(ok=True)
+    except FileNotFoundError:
+        abort(404)
+    except (OSError, ValueError):
+        return api_error("character_library_thumbnail", "无法保存角色缩略图。", 400)
+
+
+@app.route("/api/character-library/<identifier>/thumbnail", methods=["GET", "POST"])
+def api_character_thumbnail(identifier):
+    return _character_thumbnail_response(CHARACTER_LIBRARY.read_thumbnail, CHARACTER_LIBRARY.write_thumbnail, identifier)
+
+
 @app.post("/api/character-library/<identifier>/open")
 def api_open_character_library_entry(identifier):
     check_character_library_request()
@@ -1097,6 +1789,19 @@ def api_open_character_library_entry(identifier):
         return jsonify(CHARACTER_LIBRARY.open(identifier, CHARACTER_FILES))
     except (OSError, ValueError, RuntimeError):
         return api_error("character_library_missing", "此角色的文件无法读取，请重新导入。", 404)
+
+
+@app.post("/api/character-library/lookup")
+def api_lookup_character():
+    check_character_library_request()
+    value = request.get_json(silent=True)
+    ticket = value.get("ticket") if isinstance(value, dict) else None
+    if not isinstance(ticket, str) or not 1 <= len(ticket) <= 64:
+        abort(400)
+    try:
+        return jsonify(CHARACTER_LIBRARY.lookup(CHARACTER_FILES, ticket))
+    except (OSError, ValueError, RuntimeError):
+        return api_error("character_library_save", "无法识别模型和贴图，请重新选择文件。", 400)
 
 
 @app.delete("/api/character-library/<identifier>")
@@ -1114,7 +1819,7 @@ def api_remove_character_library_entry(identifier):
 
 @app.put("/api/character-library/actors/<actor_id>")
 def api_set_actor_character(actor_id):
-    check_character_library_request()
+    check_character_library_request(128 << 10)
     job = get_job(actor_id)
     if job["status"] != "done":
         abort(409)
@@ -1129,10 +1834,55 @@ def api_set_actor_character(actor_id):
     if identifier is None and not value["select"]:
         abort(400)
     try:
-        CHARACTER_LIBRARY.set_actor(actor_id, str(number) if number is not None else "single",
-                                    identifier, value.get("offsets"), select=value["select"])
+        saved = CHARACTER_LIBRARY.set_actor(actor_id, str(number) if number is not None else "single",
+                                            identifier, value.get("offsets"), select=value["select"],
+                                            retarget_preset=value.get("retarget_preset"),
+                                            remember=value.get("remember") is True)
+    except RetargetPresetError:
+        return api_error("character_library_settings", "无法保存角色设置。", 400)
     except FileNotFoundError:
         return api_error("character_library_missing", "此角色的文件无法读取，请重新导入。", 404)
+    except (OSError, ValueError, RuntimeError):
+        return api_error("character_library_settings", "无法保存角色设置。", 500)
+    return jsonify(ok=True, **(saved or {}))
+
+
+@app.put("/api/character-library/retarget-presets")
+def api_save_retarget_preset():
+    check_character_library_request(128 << 10)
+    try:
+        return jsonify(CHARACTER_LIBRARY.set_retarget_preset(request.get_json(silent=True)))
+    except (OSError, ValueError, RuntimeError):
+        return api_error("character_library_settings", "无法保存角色设置。", 400)
+
+
+@app.delete("/api/character-library/retarget-presets/<identifier>")
+def api_delete_retarget_preset(identifier):
+    check_character_library_request()
+    try:
+        CHARACTER_LIBRARY.remove_retarget_preset(identifier)
+    except FileNotFoundError:
+        abort(404)
+    except (OSError, ValueError, RuntimeError):
+        return api_error("character_library_settings", "无法保存角色设置。", 500)
+    return jsonify(ok=True)
+
+
+@app.route("/api/character-library/retarget-presets/<identifier>/thumbnail", methods=["GET", "POST"])
+def api_retarget_preset_thumbnail(identifier):
+    return _character_thumbnail_response(
+        CHARACTER_LIBRARY.read_retarget_thumbnail, CHARACTER_LIBRARY.write_retarget_thumbnail, identifier)
+
+
+@app.route("/api/character-library/retarget-presets/builtin/<profile>", methods=["PUT", "DELETE"])
+def api_builtin_retarget_preset(profile):
+    check_character_library_request(128 << 10)
+    try:
+        if request.method == "PUT":
+            return jsonify(CHARACTER_LIBRARY.set_builtin_retarget_preset(profile, request.get_json(silent=True)))
+        CHARACTER_LIBRARY.reset_builtin_retarget_preset(profile)
+    except RetargetPresetError:
+        return api_error("character_library_settings", "无法保存角色设置。", 400)
     except (OSError, ValueError, RuntimeError):
         return api_error("character_library_settings", "无法保存角色设置。", 500)
     return jsonify(ok=True)
@@ -1141,7 +1891,8 @@ def api_set_actor_character(actor_id):
 def require_desktop_session():
     key = os.environ.get(CHARACTER_KEY_ENV, "")
     supplied = request.headers.get("X-FlowHMR-Desktop-Key", "")
-    if (not local_model_request() or not key or not key.isascii() or not supplied.isascii()
+    if (not local_model_request() or request.headers.get('Sec-Fetch-Site') == 'cross-site'
+            or not key or not key.isascii() or not supplied.isascii()
             or not hmac.compare_digest(key, supplied)):
         abort(403)
 
@@ -1194,6 +1945,7 @@ def model_download_active():
 def api_info():
     config = getattr(ARGS, "model_cfg", None)
     inventory = model_inventory(ARGS.device, ARGS.ckpt, config)
+    rocm_profile = runtime_rocm.PROFILES.get(RUNTIME.active)
     if local_model_request():
         plan = missing_downloads(ARGS.device, ARGS.ckpt, config, include_hamer=True)
         inventory["download_sizes"] = {group: sum(asset.size for asset in assets) for group, assets in plan.items()}
@@ -1204,7 +1956,9 @@ def api_info():
         inventory["import"] = MODEL_IMPORTER.status()
     return jsonify({
         "model": flowhmr_paths(ARGS.ckpt, config)[0].name, "device": ARGS.device,
+        "device_backend": backend_summary(plan_device(getattr(ARGS, "device_request", ARGS.device), RUNTIME), RUNTIME, ENGINE),
         "models_loaded": ENGINE is not None,
+        "gpu_memory": _gpu_memory_snapshot(),
         "model_files": inventory,
         "runtime": RUNTIME.summary(),
         "steps": DEFAULT_PARAMS["steps"],
@@ -1213,10 +1967,72 @@ def api_info():
         "max_upload_mb": app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024),
         "postprocess_available": native_correction_available(),
         "hamer_available": any(item["id"] == "hamer" and item["status"] == "ready" for item in inventory["items"]),
+        "torso_available": torso_optimization_available(),
         "body_variants": available_variants(),
         "body_reference": smplh_reference(),
         "sam_manual_default": getattr(ARGS, "sam_chunk_default", 16),
+        "blender_bridge": {"version": 1, "motion": True, "pose_presets": True, "manual_boxes": True,
+                           "image_contact_options": True},
+        "camera_on_cpu_for_amd_igpu": bool(rocm_profile and rocm_profile.integrated),
+        "sam_hybrid_available": str(ARGS.device).split(":", 1)[0] == "cuda" and runtime_rocm.sam_hybrid_candidate(RUNTIME.active),
     })
+
+
+def _gpu_memory_snapshot():
+    cuda = getattr(sys.modules.get("torch"), "cuda", None)
+    if not getattr(cuda, "is_initialized", lambda: False)():
+        return {"initialized": False}
+    try:
+        device = cuda.current_device()
+        free, total = cuda.mem_get_info(device)
+        return {"available": True, "initialized": True, "device": int(device),
+                "allocated": int(cuda.memory_allocated(device)),
+                "reserved": int(cuda.memory_reserved(device)),
+                "free": int(free), "total": int(total)}
+    except Exception as error:
+        return {"available": True, "error": str(error)}
+
+
+def release_engine():
+    """Called with ENGINE_LOCK held; close workers/hooks before dropping weights."""
+    global ENGINE, _POSTPROCESS
+    old = ENGINE
+    if old is not None:
+        extractor = getattr(old, "sam_extractor", None)
+        close = getattr(extractor, "shutdown", None) or getattr(extractor, "close", None)
+        if close is not None:
+            close()
+        del extractor
+    ENGINE = _POSTPROCESS = None
+    del old
+    gc.collect()
+    cuda = getattr(sys.modules.get("torch"), "cuda", None)
+    if getattr(cuda, "is_initialized", lambda: False)():
+        cuda.empty_cache()
+        ipc_collect = getattr(cuda, "ipc_collect", None)
+        if ipc_collect is not None:
+            ipc_collect()
+    return _gpu_memory_snapshot()
+
+
+@app.get("/api/gpu")
+def api_gpu():
+    return jsonify(models_loaded=ENGINE is not None, memory=_gpu_memory_snapshot())
+
+
+@app.post("/api/gpu/release")
+def api_gpu_release():
+    """Unload idle models without interrupting generation or scene assembly."""
+    if not local_model_request():
+        return api_error("gpu_local_only", "请从本机释放显存。", 403)
+    if not ENGINE_LOCK.acquire(blocking=False):
+        return api_error("jobs_active", "任务仍在处理或收尾，请稍后释放。", 409)
+    try:
+        if jobs_active():
+            return api_error("jobs_active", "请先等待或停止当前任务。", 409)
+        return jsonify(ok=True, models_loaded=False, memory=release_engine())
+    finally:
+        ENGINE_LOCK.release()
 
 
 @app.get("/api/runtime")
@@ -1281,7 +2097,7 @@ def requires_runtime(view):
             state = RUNTIME.summary()
             if not state["ready"]:
                 message = ("请先重启运行环境，完成切换。" if state["pending_restart"] else
-                           "请在右上角「运行环境」下载并启用与显卡匹配的运行环境。")
+                           "请在右上角「运行环境」下载并启用推理环境。")
                 return jsonify(error=message, code="runtime_required",
                                error_code="runtime_restart_required" if state["pending_restart"] else "runtime_required"), 409
             return view(*args, **kwargs)
@@ -1374,12 +2190,21 @@ def api_upload():
         return api_error("video_format", f"unsupported format {ext}; use {formats}", 400, ext=ext, formats=formats)
     try:
         params = parse_params(request.form)
+        metadata = submission_metadata(request.form, params)
     except UserMessage as e:
         return api_error(e.code, str(e), 400, **e.params)
-    job = new_job(f.filename, params, ext)
+    image_source = is_image_job({"source_kind": request.form.get("source_kind"),
+                                 "source_name": request.form.get("source_name"), "filename": f.filename})
+    if image_source:
+        # Images follow the same two selection switches as videos. Only their
+        # timeline is fixed here; do not force a single-person confirmation.
+        params.update(static_camera=True, start_frame=0, end_frame=0, auto_frames=True)
+    job = new_job(f.filename, params, ext, **metadata)
+    job["source_kind"] = "image" if image_source else "video"
+    job["source_name"] = os.path.basename(request.form.get("source_name", "").replace("\\", "/"))[:255] or f.filename
     f.save(input_video(job["id"]))
     enqueue(job)
-    return jsonify({"job_id": job["id"]})
+    return jsonify(job_id=job['id'], status='queued', params=params, selection_policy=job['selection_policy'])
 
 
 @app.route("/api/jobs/<job_id>/rerun", methods=["POST"])
@@ -1399,12 +2224,17 @@ def api_rerun(job_id):
     if not isinstance(body, dict):
         return api_error("param_invalid", "生成参数无效。", 400)
     if is_scene:
-        body = {**body, "manual_select": True, "reselect_person": True}
+        body = {**body, "reselect_person": True}
     try:
         params = parse_params(body, base=src["params"])
+        metadata = submission_metadata(body, params)
     except UserMessage as e:
         return api_error(e.code, str(e), 400, **e.params)
-    job = new_job(src["filename"], params, src["ext"])
+    if is_image_job(src):
+        params.update(static_camera=True, start_frame=0, end_frame=0, auto_frames=True)
+    job = new_job(src["filename"], params, src["ext"], **metadata)
+    job["source_kind"] = "image" if is_image_job(src) else "video"
+    job["source_name"] = src.get("source_name", src["filename"])
     _link_video(input_video(job_id), input_video(job["id"]))
     old_thumbnail = os.path.join(job_dir(job_id), "thumbnail.jpg")
     if os.path.isfile(old_thumbnail):
@@ -1416,23 +2246,25 @@ def api_rerun(job_id):
         skip = (f"{SUB}_seed",)  # generated motion is recomputed
         reselect = _to_bool(body.get("reselect_person"), False)
         camera_changed = params["static_camera"] != src["params"].get("static_camera", False)
-        def requested_range(settings):
-            end = settings.get("end_frame")
-            if not settings.get("auto_frames", True) and settings.get("max_frames") is not None:
-                limit = settings["max_frames"] - 1
-                end = min(end, limit) if end is not None else limit
-            return settings.get("start_frame", 0), end
-        range_changed = requested_range(src["params"]) != requested_range(params)
-        if reselect:
-            # per-person caches are invalidated so detection runs and the user picks again
-            skip += (f"{SUB}_bbox.npz",)
-        if reselect or camera_changed or range_changed:
+        scan_range = job_detection_range(params)
+        bbox_name = f"{SUB}_bbox.npz"
+        detection_changed = (reselect or job_detection_range(src["params"]) != scan_range or
+                             not cached_detection_matches(os.path.join(src_sub, bbox_name), scan_range))
+        if detection_changed:
+            skip += (bbox_name,)
+        if detection_changed or camera_changed:
             # SAM conditioning also depends on camera intrinsics, not just frame count.
             skip += (f"{SUB}_sam3d_feat.pt", f"{SUB}_vggt_camera.npz",
                      f"{SUB}_sam3d_feat_static.pt", f"{SUB}_static_camera.npz")
         elif not params["static_camera"] and params["vggt_interval"] != src["params"]["vggt_interval"]:
             skip += (f"{SUB}_sam3d_feat.pt", f"{SUB}_vggt_camera.npz")
-        if params["sam_chunk_size"] != src["params"].get("sam_chunk_size", DEFAULT_PARAMS["sam_chunk_size"]):
+        if any(params[key] != src["params"].get(key, DEFAULT_PARAMS[key])
+               for key in ("sam_chunk_size", "sam_hand_stride", "sam_backend")):
+            skip += (f"{SUB}_sam3d_feat.pt", f"{SUB}_sam3d_feat_static.pt")
+        previous_sam = (src.get("sam_batch") or {}).get("backend", "gpu")
+        device_type = str(ARGS.device).split(":", 1)[0]
+        next_sam = device_type if device_type in ("cpu", "xpu") else params["sam_backend"]
+        if previous_sam != next_sam:
             skip += (f"{SUB}_sam3d_feat.pt", f"{SUB}_sam3d_feat_static.pt")
         for name in os.listdir(src_sub):
             path = os.path.join(src_sub, name)
@@ -1447,7 +2279,7 @@ def api_rerun(job_id):
             update_job(job["id"], selected_person=person, person_track=src.get("person_track"),
                        selection_auto=src.get("selection_auto", False))
     enqueue(job)
-    return jsonify({"job_id": job["id"]})
+    return jsonify(job_id=job['id'], status='queued', params=params, selection_policy=job['selection_policy'])
 
 
 @app.route("/api/jobs/<job_id>/cancel", methods=["POST"])
@@ -1476,7 +2308,15 @@ def api_cancel_job(job_id):
     return jsonify({"ok": True, "job_id": job_id})
 
 
+def is_image_job(job):
+    if job.get("source_kind") in ("image", "video"):
+        return job["source_kind"] == "image"
+    return any(bool(re.search(r"\.(png|jpe?g|jfif|webp|bmp|tiff?)(?:\.(webm|mp4))?$",
+                             job.get(key) or "", re.I)) for key in ("source_name", "filename"))
+
+
 @app.route("/api/jobs/<job_id>/select", methods=["POST"])
+@app.route("/api/jobs/<job_id>/select-boxes", methods=["POST"])
 def api_select(job_id):
     """Resume with {"people": [candidate indices]}; older clients may send one person."""
     body = request.get_json(silent=True)
@@ -1494,6 +2334,15 @@ def api_select(job_id):
         if not isinstance(people, list) or not people or any(type(i) is not int or not 0 <= i < n for i in people):
             return api_error("people_required", "请至少勾选一个已检测到的人物。", 400)
         people = list(dict.fromkeys(people))
+        try:
+            edits = validate_edits(body.get("box_edits", []), job["candidates"], job.get("video_size") or [0, 0])
+            if any(e["person"] not in people for e in edits):
+                raise ValueError("修正过人物框的角色也需要勾选，或先撤销框选")
+        except (ValueError, TypeError) as error:
+            return api_error("invalid_person_box", str(error), 400)
+        slot["box_edits"] = edits
+        job["box_edits"] = edits
+        _persist_job_locked(job)
         slot["people"] = people
         slot["event"].set()
     return jsonify(ok=True, person=people[0], people=people)
@@ -1588,8 +2437,9 @@ def api_jobs():
     except (ValueError, TypeError, binascii.Error, OverflowError):
         return api_error("history_invalid_page", "历史记录分页无效，请刷新后重试。", 400)
 
-    keys = ("id", "filename", "status", "progress", "created", "finished", "num_frames", "params", "recovered",
-            "selected_person", "person_count", "person_done")
+    keys = ("id", "filename", "status", "progress", "created", "finished", "num_frames", "params", "recovered", "source", "selection_policy",
+            "selected_person", "person_count", "person_done", "message", "loading_models", "scene_state", "source_frames", "stages",
+            "sam_batch", "camera", "source_kind", "source_name")
     with JOBS_LOCK:
         groups = defaultdict(list)
         for row in JOBS.values():
@@ -1870,6 +2720,10 @@ def api_fbx(job_id):
     prefix = f"fbx_scene_v5_{signature}" if chosen is not None else f"fbx_mmr_v{revision}"
     if profile != "flowhmr":
         revision = 3 if profile in ("metahuman", "mixamo", "maya_adv") else 2
+        if template_kind == "mixamo":
+            revision += 1  # Invalidate pre-fix Mixamo and iClone template exports.
+            if profile == "mixamo":
+                revision += 1  # Separate from existing generic Mixamo FBX.
         prefix = f"fbx_{profile}_v{revision}_{signature or 'single'}"
     pose_tag = f"_{first_pose}_pose" if first_pose != "none" else ""
     cache_name = f"{prefix}_{file_stamp(source)}_{suffix}{tag}{pose_tag}"
@@ -1920,6 +2774,113 @@ def api_fbx(job_id):
     else:
         name = f"{export_stem(job)}_{profile}_{suffix}.fbx"
     return send_file(path, mimetype="application/octet-stream", as_attachment=True, download_name=name, conditional=True)
+
+
+@app.post("/api/jobs/<job_id>/target-fbx")
+def api_target_fbx(job_id):
+    if not local_model_request():
+        return api_error("target_fbx_local_only", "请在本机 FlowHMR 导出角色动作。", 403)
+    job, source, available = motion_export_source(job_id)
+    if find_spec("fbx") is None:
+        abort(404)
+    profile = request.args.get("profile")
+    mode = request.args.get("mesh", "0")
+    if profile not in ("mixamo", "metahuman", "retarget_fbx") or mode not in ("0", "1") or (mode == "1" and profile == "metahuman"):
+        return api_error("fbx_profile", "请选择有效的 FBX 骨架预设。", 400)
+    request.max_content_length = MAX_MODEL_BYTES + (64 << 20) + (1 << 20)
+    if request.content_length and request.content_length > request.max_content_length:
+        abort(413)
+    try:
+        chosen, _ = select_export_people(available)
+        if chosen is not None and len(chosen) != 1:
+            code = "target_fbx_one_character" if profile == "retarget_fbx" else f"{profile}_export_options"
+            raise UserMessage("每次只导出一个目标角色。", code)
+    except UserMessage as error:
+        return api_error(error.code, str(error), 400, **error.params)
+    from flowhmr.core.export.target_fbx import (
+        AmbiguousFbxPath, MAX_TARGET_TRACKS, MAX_TARGET_VALUES, TARGET_WIDTH, write_target_fbx,
+    )
+
+    result = None
+    try:
+        with np.load(source, allow_pickle=False) as data:
+            fps = float(data.get("mocap_framerate", 30))
+            person = chosen[0] if chosen else None
+            frames = len(data[f"trans_{person['person']}"] if person else data["trans"])
+            start = person["start"] if person else 0
+        if not math.isfinite(fps) or not 0 < fps <= 240 or frames < 1:
+            raise ValueError("Invalid motion timeline")
+        tracks, samples = request.files.get("tracks"), request.files.get("samples")
+        if tracks is None or samples is None:
+            raise ValueError("The baked FBX request is incomplete")
+        paths_raw = tracks.stream.read((512 << 10) + 1)
+        if len(paths_raw) > 512 << 10:
+            raise ValueError("The FBX bone paths are too long")
+        paths = json.loads(paths_raw)
+        if (not isinstance(paths, list) or not 0 < len(paths) <= MAX_TARGET_TRACKS
+                or any(not isinstance(p, list) or not 0 < len(p) <= 128 or any(
+                    not isinstance(part, str) or len(part) > 512 or "\0" in part for part in p) for p in paths)
+                or len({tuple(p) for p in paths}) != len(paths)):
+            raise ValueError("Invalid FBX bone paths")
+        count = len(paths) * frames * TARGET_WIDTH
+        if count > MAX_TARGET_VALUES:
+            return api_error("target_fbx_limit", "动作或骨架太大，请缩短片段后再导出。", 413)
+        raw = samples.stream.read(4 * count + 1)
+        if len(raw) != 4 * count:
+            raise ValueError("The baked FBX does not match the job's frame count")
+        values = np.frombuffer(raw, dtype="<f4").reshape(len(paths), frames, TARGET_WIDTH)
+        if (not np.isfinite(values).all() or
+                not np.allclose(np.linalg.norm(values[..., 3:7], axis=-1), 1, atol=1e-3)):
+            raise ValueError("The baked FBX contains invalid transforms")
+        character_id = request.form.get("character")
+        upload = request.files.get("character_file")
+        if bool(character_id) == bool(upload):
+            raise ValueError("An applied FBX character is required")
+        exports = Path(source).parent / "exports"
+        exports.mkdir(exist_ok=True)
+        # Named paths are validated against the FBX itself. For a library
+        # character, resolve a fresh local file ticket; never accept a path.
+        with FBX_EXPORT_LOCK, tempfile.TemporaryDirectory(dir=exports, prefix=".retarget-") as scratch:
+            if character_id:
+                if not re.fullmatch(r"[0-9a-f]{64}", character_id):
+                    raise ValueError("Invalid character library ID")
+                ticket = CHARACTER_LIBRARY.open(character_id, CHARACTER_FILES)
+                target = CHARACTER_FILES.resource(ticket["ticket"])
+                if target is None or target.suffix.lower() != ".fbx":
+                    raise ValueError("The applied FBX character is no longer available")
+            else:
+                if not (upload.filename or "").lower().endswith(".fbx"):
+                    raise ValueError("The applied character is not an FBX")
+                target = Path(scratch) / "character.fbx"
+                size = 0
+                with target.open("wb") as saved:
+                    for block in iter(lambda: upload.stream.read(1 << 20), b""):
+                        size += len(block)
+                        if size > MAX_MODEL_BYTES:
+                            abort(413)
+                        saved.write(block)
+                if not size:
+                    raise ValueError("The applied FBX file is empty")
+            output = Path(scratch) / "motion.fbx"
+            write_target_fbx(target, output, paths, values, fps, start, profile, with_skin=mode == "1")
+            result = tempfile.TemporaryFile(mode="w+b")
+            with output.open("rb") as stream:
+                shutil.copyfileobj(stream, result)
+            length = result.tell()
+            result.seek(0)
+    except AmbiguousFbxPath as error:
+        return api_error("target_fbx_ambiguous_path", "同一父骨下有重名节点，无法安全导出。", 422, path=str(error)[:300])
+    except (ValueError, KeyError, BadZipFile, OSError, RuntimeError) as error:
+        if result is not None:
+            result.close()
+        app.logger.exception("Target FBX export failed for job %s", job_id)
+        return api_error("target_fbx_failed", "无法按当前角色导出。", 422, detail=str(error)[:300])
+    stem = export_stem(job) if not chosen else f"{os.path.splitext(job['filename'])[0]}_person{person['person']}"
+    suffix = "skin" if mode == "1" else "skeleton"
+    response = send_file(result, mimetype="application/octet-stream", as_attachment=True,
+                         download_name=f"{stem}_{profile}_{suffix}.fbx")
+    response.content_length = length
+    return response
 
 
 def write_humanoid_motion(source, path, chosen, format_name, export_person):
@@ -2049,20 +3010,55 @@ def api_thumbnail(job_id):
     job = get_job(job_id)
     directory = job_dir(job_id)
     person = job.get("selected_person") if job.get("person_batch") != job_id else None
-    if person is not None:
+    original = request.args.get("source") == "original"
+    if person is not None and not original:
         path = os.path.join(directory, "persons", f"{person}.jpg")
         if os.path.isfile(path):
             return send_file(path, mimetype="image/jpeg", conditional=True, max_age=3600)
-    thumbnail = os.path.join(directory, "thumbnail.jpg")
+    thumbnail = os.path.join(directory, "source-thumbnail.jpg" if original else "thumbnail.jpg")
     if not os.path.isfile(thumbnail):
         canonical = os.path.join(directory, SUB, f"{SUB}_30fps.mp4")
         video = canonical if os.path.isfile(canonical) else os.path.join(directory, f"input{job['ext']}")
         try:
-            if not os.path.isfile(video) or not ensure_thumbnail(video, thumbnail):
+            params = job.get("params") or {}
+            seconds = (params.get("start_frame", 0) / 30 if original else None)
+            if not os.path.isfile(video) or not ensure_thumbnail(video, thumbnail, time_seconds=seconds):
                 abort(404)
         except FileNotFoundError:
             abort(404)
     return send_file(thumbnail, mimetype="image/jpeg", conditional=True, max_age=3600)
+
+
+@app.get("/api/jobs/<job_id>/blender-motion")
+def api_blender_motion(job_id):
+    job = get_job(job_id)
+    if job["status"] != "done":
+        abort(409)
+    scene = job.get("scene") if job.get("person_batch") == job_id else None
+    if job.get("person_batch") == job_id and not scene:
+        abort(409)
+    directory = Path(job_dir(job_id)) / ("scene" if scene else "")
+    people = scene["people"] if scene else None
+    if "person" in request.args:
+        number = request.args.get("person", type=int)
+        people = [p for p in people or [] if p["person"] == number]
+        if not people:
+            return api_error("blender_person", "请选择此动作中的人物。", 400)
+    body = request.args.get("body", "source")
+    if body not in {"source", "neutral", "male", "female"}:
+        return api_error("blender_body", "请选择有效的身体模型。", 400)
+    try:
+        from flowhmr.utils.runtime_blender import blender_motion
+        reference = job_body_reference(job) if body == "source" else body
+        result = blender_motion(directory / "motion.npz", model_path(reference),
+                                people=people, job_id=job_id,
+                                source_image=is_image_job(job),
+                                source_start=(job.get("track_range") or [0])[0],
+                                include_mesh=request.args.get("mesh", "1") != "0")
+    except (ValueError, KeyError, OSError, BadZipFile) as error:
+        return api_error("blender_motion", f"无法读取 Blender 动作：{error}", 422)
+    return send_file(result, mimetype="application/octet-stream", as_attachment=True,
+                     download_name=f"{job_id}.blender.npz")
 
 
 @app.route("/api/jobs/<job_id>/skeleton")
@@ -2172,12 +3168,17 @@ def parse_args():
     p.add_argument("--model_cfg", default=None)
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8080)
-    p.add_argument("--device", default="cuda")
+    p.add_argument("--device", default="auto", help=DEVICE_HELP)
     p.add_argument("--sam-chunk-default", type=int, default=16, help="Initial value in the manual batch field")
     p.add_argument("--work_dir", default=os.path.join(REPO_ROOT, "output", "web_jobs"))
     args = p.parse_args()
     if args.sam_chunk_default < 1:
         p.error("--sam-chunk-default must be a positive integer")
+    args.device_request = args.device
+    try:
+        args.device = plan_device(args.device_request, RUNTIME).device
+    except ValueError as error:
+        p.error(str(error))
     return args
 
 
@@ -2196,7 +3197,24 @@ def main():
     INSPECTION = PreviewInspection()
     threading.Thread(target=worker_loop, daemon=True).start()
     print(f"\n  FlowHMR web demo ready:  http://{ARGS.host}:{ARGS.port}\n")
-    app.run(host=ARGS.host, port=ARGS.port, threaded=True, debug=False)
+    # Bind the backend first; failed binds must not launch an orphan MCP service.
+    server = make_server(ARGS.host, ARGS.port, app, threaded=True)
+
+    def start_mcp():
+        try:
+            MCP_SERVICE.start_if_configured(f'http://127.0.0.1:{server.server_port}')
+        except Exception as error:
+            MCP_SERVICE.startup_error = str(error)
+            app.logger.exception('MCP auto-start failed')
+        finally:
+            UI_EVENTS.publish('mcp_service')
+
+    threading.Thread(target=start_mcp, daemon=True).start()
+    try:
+        server.serve_forever()
+    finally:
+        MCP_SERVICE.stop()
+        server.server_close()
 
 
 if __name__ == "__main__":

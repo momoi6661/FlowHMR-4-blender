@@ -1,4 +1,5 @@
 import { getLanguage, setText, t } from "./i18n.js";
+import { sourceName } from "./image-media.js";
 
 export const $ = (id) => document.getElementById(id);
 
@@ -36,8 +37,9 @@ export function formatBytes(n) {
 export const statusLabel = (status) => t(`job.${status}`, {}, status);
 
 export function jobLabel(job) {
-  if (job.person_count > 1) return `${job.filename} · ${t("person.count", { count: job.person_count })}`;
-  return job.selected_person == null ? job.filename : `${job.filename} · ${t("person.number", { number: job.selected_person + 1 })}`;
+  const name = sourceName(job);
+  if (job.person_count > 1) return `${name} · ${t("person.count", { count: job.person_count })}`;
+  return job.selected_person == null ? name : `${name} · ${t("person.number", { number: job.selected_person + 1 })}`;
 }
 
 /** Distinct colours for person boxes; index = candidate index. */

@@ -136,7 +136,10 @@ def _shared_camera(video, entries, destination, frame_range, device, check, noti
 def _observe(video, tracks, intrinsics, first, extractor, check, notify):
     import cv2
     import torch
+    from .sam_batch import memory_error_resource
 
+    encoder_device = getattr(extractor, "xpu_backbone_device", None)
+    accelerator = torch.xpu if encoder_device is not None else torch.cuda
     samples = defaultdict(list)
     for t in tracks:
         t["samples"] = []
@@ -158,19 +161,20 @@ def _observe(video, tracks, intrinsics, first, extractor, check, notify):
             if not ok:
                 raise ValueError("原视频帧无法读取，无法对齐多人站位。")
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            cursor, size = 0, 8
+            cursor, size = 0, 2 if encoder_device is not None else 8
             while cursor < len(selected):
                 chunk = selected[cursor:cursor + size]
                 boxes = np.stack([t["boxes"][frame - t["range"][0]] for t in chunk])
                 try:
                     points = extractor.scene_keypoints(image, boxes, intrinsics[frame - first], MHR_JOINTS)
-                except torch.cuda.OutOfMemoryError:
-                    if size == 1:
+                except (RuntimeError, MemoryError) as error:
+                    if len(chunk) == 1 or memory_error_resource(error) is None:
                         raise
                     points = None
                 if points is None:
-                    torch.cuda.empty_cache()
-                    size //= 2
+                    if accelerator.is_initialized():
+                        accelerator.empty_cache()
+                    size = max(1, len(chunk) // 2)
                     continue
                 if points.shape != (len(chunk), len(MHR_JOINTS), 3):
                     raise ValueError("多人站位采样返回了不完整的人体位置。")
@@ -207,7 +211,7 @@ def _save_scene_motion(destination, tracks, people):
     tmp.replace(destination / "motion.npz")
 
 
-def build_group_scene(destination, members, inspection, extractor, device, *, check=lambda: None, notify=lambda _: None):
+def build_group_scene(destination, members, inspection, acquire_sam, device, *, check=lambda: None, notify=lambda _: None):
     """Create one scene manifest and one aligned motion file for completed jobs."""
     entries = [(job, Path(directory)) for job, directory in members]
     destination = Path(destination)
@@ -233,7 +237,9 @@ def build_group_scene(destination, members, inspection, extractor, device, *, ch
     first = min(t["range"][0] for t in tracks)
     last = max(t["range"][1] for t in tracks)
     K, rt, camera = _shared_camera(video, entries, destination, (first, last), device, check, notify)
-    _observe(video, tracks, K, first, extractor, check, notify)
+    check()
+    with acquire_sam() as extractor:
+        _observe(video, tracks, K, first, extractor, check, notify)
     for t in tracks:
         if not t["samples"]:
             raise ValueError(f"人物 {t['job']['selected_person'] + 1} 没有可用的站位观测。")

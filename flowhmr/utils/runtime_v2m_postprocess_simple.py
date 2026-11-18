@@ -89,6 +89,29 @@ class PostprocessPipeline:
         options = self.options
         fps = float(kwargs.get("fps", 30.0))
         floor = None if options["auto_floor"] else options["floor"]
+        if kwargs.get("static_pose"):
+            if length != 1:
+                raise ValueError("Static pose correction requires exactly one frame")
+            # A photo gives no temporal contact evidence. When the user opts in,
+            # place its lowest sole probe on the requested plane by translation
+            # alone; keep all body and finger rotations intact.
+            floor = 0.0 if floor is None else float(floor)
+            offset = floor - float(probes[..., 1].min())
+            result = dict(output)
+            result["rot6d"] = rot6d.clone()
+            result["trans"] = trans.clone()
+            result["trans"][..., 1] += offset
+            result["root_rot6d"] = result["rot6d"][:, :, 0]
+            result["body_rot6d"] = result["rot6d"][:, :, 1:]
+            for key in ("local_joints_positions", "smooth_root_pos", "pelvis_world"):
+                result.pop(key, None)
+            result["source"] = "initial"
+            result["method"] = "single-pose sole placement"
+            self.last_report = dict(method=result["method"], preset=options["preset"],
+                floor=floor, contacts=0, static_pose=True, height_offset_m=offset,
+                warning="", elapsed_seconds=time.perf_counter() - started)
+            check()
+            return result
         ranges = None if options["foot_lock"] else [[], []]
 
         def plan_contacts(values, height):

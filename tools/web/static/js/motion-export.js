@@ -5,18 +5,17 @@ import * as api from "./api.js";
 const FORMAT_STORAGE = "flowhmr-export-format";
 const SKIN_STORAGE = "flowhmr-fbx-with-skin";
 const POSE_STORAGE = "flowhmr-fbx-first-pose";
-const TEMPLATE_MAX_MB = 128;
 
 export function initMotionExport(getBodyVariant, viewer) {
   const dialog = $("fbxExportDialog"), button = $("dlFbx"), menu = $("menuFbx");
   const format = $("motionExportFormat"), confirm = $("fbxConfirm");
   const skin = $("fbxWithSkin"), pose = $("fbxFirstPose"), peopleField = $("fbxPeople");
-  const template = $("fbxTemplate"), error = $("motionExportError");
-  const clearTemplate = $("fbxTemplateClear"), templateHint = $("fbxTemplateHint");
+  const error = $("motionExportError"), openCharacters = $("fbxChooseCharacter");
+  const mixamoRig = $("mixamoRig"), mixamoCharacter = $("mixamoRigCharacter");
   const vmdTarget = $("vmdTarget"), characterOption = $("vmdTargetCharacter");
   const chooseCharacter = $("vmdChooseCharacter");
   const formats = [...format.options];
-  let preferred = localStorage.getItem(FORMAT_STORAGE) || "flowhmr";
+  let preferred = localStorage.getItem(FORMAT_STORAGE);
   if (preferred === "mixamo_iclone") preferred = "mixamo";
   let result = null, pending = null, entries = [], multiPeople = [], single = false;
 
@@ -26,13 +25,15 @@ export function initMotionExport(getBodyVariant, viewer) {
 
   const selected = () => entries.filter(({ input }) => input.checked).map(({ input }) => input.value);
   const targets = () => viewer.getPmxActors(selected());
+  const retargeted = () => viewer.getRetargetActors(selected());
+  const fbxActor = (profile) => viewer.getFbxActor(selected(), profile);
   function selectMode(next) {
     if (next === single) return;
     if (next) multiPeople = selected();
     const keep = next ? [multiPeople[0] ?? entries[0]?.input.value] : multiPeople;
     for (const { input } of entries) {
       input.type = next ? "radio" : "checkbox";
-      if (next) input.name = "fbx-template-person"; else input.removeAttribute("name");
+      if (next) input.name = "fbx-export-person"; else input.removeAttribute("name");
       input.checked = keep.includes(input.value);
     }
     single = next;
@@ -41,25 +42,23 @@ export function initMotionExport(getBodyVariant, viewer) {
     setText(error, value);
     show(error, !!value);
   }
-  function validTemplate() {
-    const file = template.files[0];
-    return file && /\.fbx$/i.test(file.name) && file.size > 0 && file.size <= TEMPLATE_MAX_MB * 1024 * 1024;
-  }
-  const usesTemplate = (profile) => profile === "metahuman" || (profile === "mixamo" && template.files.length > 0);
   function sync() {
+    const glb = formats.find(({value})=>value==="retarget_glb");
+    glb.disabled=glb.hidden=!result || !retargeted().length;
+    if (glb.disabled && format.value==="retarget_glb") format.value="flowhmr";
     const profile = format.value;
-    const mixamo = profile === "mixamo";
-    const useTemplate = usesTemplate(profile);
-    const showTemplate = mixamo || profile === "metahuman";
-    const singlePerson = useTemplate || profile === "maya_adv";
+    const mixamo = profile === "mixamo", metahuman = profile === "metahuman";
+    const currentFbx = profile === "retarget_fbx";
+    const singlePerson = currentFbx || metahuman || profile === "maya_adv";
     selectMode(singlePerson);
-    show("standardFbxOptions", !useTemplate && (profile === "flowhmr" || mixamo));
-    show("fbxTemplateRow", showTemplate);
-    show(clearTemplate, showTemplate && template.files.length > 0);
-    if (showTemplate) setText($("fbxTemplateLabel"), m(`export.${profile}_template`));
-    show(templateHint, mixamo);
-    if (mixamo) template.setAttribute("aria-describedby", templateHint.id);
-    else template.removeAttribute("aria-describedby");
+    const actor = mixamo || metahuman || currentFbx ? fbxActor(profile) : null;
+    const useActor = actor && (!mixamo || mixamoRig.value !== "generic");
+    show("mixamoRigOptions", mixamo && !!actor);
+    if (mixamo && actor) setText(mixamoCharacter, m("export.fbx_target", { name: actor.asset.name }));
+    show(openCharacters, (metahuman || currentFbx) && !actor);
+    show("standardFbxOptions", profile === "flowhmr" || mixamo || (currentFbx && !!actor));
+    show("fbxReferenceOptions", profile === "flowhmr" || (mixamo && !useActor));
+    setText($("fbxSkinHint"), m(useActor ? "export.fbx_target_skin" : "export.skin_hint"));
     show("vmdOptions", profile === "vmd");
     const roles = targets();
     characterOption.disabled = characterOption.hidden = !roles.length;
@@ -68,14 +67,17 @@ export function initMotionExport(getBodyVariant, viewer) {
     else vmdTarget.value = "generic";
     let hint = profile;
     if (profile === "vmd") hint = vmdTarget.value === "target" ? "vmd_target" : "vmd_generic";
-    if (mixamo) hint = useTemplate ? "mixamo_target" : "";
-    setText($("motionExportHint"), hint ? m(`export.${hint}_hint`) : "");
+    if (mixamo) hint = useActor ? "mixamo_target" : "mixamo";
+    if (metahuman && !actor) hint = "metahuman_required";
+    if (currentFbx && !actor) hint = "retarget_fbx_required";
+    setText($("motionExportHint"), profile === "retarget_glb" ? m("retarget.glb_hint") :
+      hint ? m(`export.${hint}_hint`, { name: actor?.asset.name }) : "");
     setText($("exportPeopleLabel"), m(singlePerson ? "export.select_person" : "export.select_people"));
     const busy = !!pending;
-    format.disabled = peopleField.disabled = template.disabled = vmdTarget.disabled = chooseCharacter.disabled = busy;
-    clearTemplate.disabled = busy;
+    format.disabled = peopleField.disabled = vmdTarget.disabled = chooseCharacter.disabled =
+      mixamoRig.disabled = openCharacters.disabled = skin.disabled = busy;
     confirm.disabled = !result || !profile || busy || (entries.length > 0 && !selected().length)
-      || (useTemplate && !validTemplate());
+      || ((metahuman || currentFbx) && !actor);
     setText(confirm, m(busy ? "export.preparing" : "common.export"));
   }
   function setPeople(scene) {
@@ -117,12 +119,23 @@ export function initMotionExport(getBodyVariant, viewer) {
     dialog.returnValue = "";
     showError();
     vmdTarget.value = targets().length ? "target" : "generic";
+    mixamoRig.value = "target";
+    // Resolve the default after preview and character restoration have run.
+    const currentFbx = formats.find(({value}) => value === "retarget_fbx");
+    if ((!preferred || preferred === "retarget_glb") && !currentFbx.disabled && fbxActor("retarget_fbx")) {
+      format.value = "retarget_fbx";
+    } else if (preferred === "retarget_glb" && retargeted().length) format.value = preferred;
     sync();
     dialog.showModal();
   };
   menu.onclick = () => button.click();
   peopleField.addEventListener("change", sync);
   vmdTarget.addEventListener("change", sync);
+  mixamoRig.addEventListener("change", () => { showError(); sync(); });
+  openCharacters.onclick = () => {
+    dialog.close("character");
+    viewer.openCharacter(selected()[0]);
+  };
   chooseCharacter.onclick = () => {
     dialog.close("character");
     viewer.openCharacter();
@@ -133,23 +146,13 @@ export function initMotionExport(getBodyVariant, viewer) {
     sync();
   });
   format.addEventListener("change", () => {
-    template.value = "";
     showError();
     sync();
   });
-  template.addEventListener("change", () => {
-    const file = template.files[0];
-    const kind = format.value;
-    showError(!file || validTemplate() ? "" : file.size > TEMPLATE_MAX_MB * 1024 * 1024
-      ? m(`server.${kind}_template_size`, { max: TEMPLATE_MAX_MB }) : m(`server.${kind}_template_required`));
-    sync();
-  });
-  clearTemplate.onclick = () => { template.value = ""; showError(); sync(); };
   dialog.addEventListener("close", () => {
     if (dialog.open) return;
     pending?.abort();
     pending = null;
-    template.value = "";
     sync();
   });
   dialog.querySelector("form").addEventListener("submit", async (event) => {
@@ -162,12 +165,17 @@ export function initMotionExport(getBodyVariant, viewer) {
     preferred = profile;
     localStorage.setItem(FORMAT_STORAGE, profile);
     const targetVmd = profile === "vmd" && vmdTarget.value === "target";
-    if (profile === "vrma" || (profile === "vmd" && !targetVmd)) {
+    const vmdActors = profile === "vmd" ? viewer.getVmdActors(people) : [];
+    const correctedVmd = !targetVmd && vmdActors.some((member) => member.poseOffsets);
+    const actor = profile === "retarget_fbx" || profile === "metahuman" || (profile === "mixamo" && mixamoRig.value !== "generic")
+      ? fbxActor(profile) : null;
+    if ((profile === "metahuman" || profile === "retarget_fbx") && !actor) { sync(); return; }
+    if (profile === "vrma" || (profile === "vmd" && !targetVmd && !correctedVmd)) {
       dialog.close("export");
       download(api.motionUrl(id, profile, people));
       return;
     }
-    if (!usesTemplate(profile) && !targetVmd) {
+    if (!actor && profile !== "vmd" && profile !== "retarget_glb") {
       const advancedSkeleton = profile === "maya_adv";
       if (!advancedSkeleton) {
         localStorage.setItem(SKIN_STORAGE, skin.checked ? "on" : "off");
@@ -182,14 +190,26 @@ export function initMotionExport(getBodyVariant, viewer) {
     showError();
     sync();
     try {
-      const { blob, filename } = targetVmd
-        ? await makePmxVmd(viewer, people, result.filename, operation.signal)
-        : await api.exportTemplateFbx(id, people, profile, template.files[0], operation.signal);
+      let exported;
+      if (profile==="retarget_glb") {
+        const { bakeRetargetGlb }=await import("./retarget-export.js");
+        const stem=(result.filename||"FlowHMR").replace(/\.[^.]+$/,"").replace(/[<>:"/\\|?*\x00-\x1f]/g,"_").slice(0,100);
+        exported=await bakeRetargetGlb(retargeted(),stem,operation.signal);
+      } else if (profile === "vmd") {
+        exported = await makeVmd(vmdActors, result.filename, targetVmd, operation.signal);
+      } else {
+        const { bakeTargetFbx } = await import("./retarget-fbx.js");
+        const baked = await bakeTargetFbx(actor, operation.signal, profile);
+        const offersSkin = profile === "mixamo" || profile === "retarget_fbx";
+        const withSkin = offersSkin && skin.checked;
+        if (offersSkin) localStorage.setItem(SKIN_STORAGE, withSkin ? "on" : "off");
+        exported = await api.exportTargetFbx(id, people, profile, actor, baked, withSkin, operation.signal);
+      }
       if (pending !== operation || result?.id !== id || !dialog.open) return;
-      downloadBlob(blob, filename);
+      downloadBlob(exported.blob, exported.filename);
     } catch (cause) {
       if (!operation.signal.aborted && dialog.open) {
-        showError(targetVmd ? m("export.pmx_vmd_failed", { detail: cause }) : cause);
+        showError(profile === "vmd" ? m("export.pmx_vmd_failed", { detail: cause }) : cause);
       }
     } finally {
       if (pending === operation) {
@@ -204,7 +224,7 @@ export function initMotionExport(getBodyVariant, viewer) {
       result = { id, filename: job.filename };
       const availableByFormat = { vmd: !!job.has_vmd, vrma: !!job.has_vrma };
       for (const option of formats) option.disabled = !(availableByFormat[option.value] ?? job.has_fbx);
-      const available = formats.filter((option) => !option.disabled);
+      const available = formats.filter((option) => !option.disabled && option.value!=="retarget_glb");
       format.value = (available.find((option) => option.value === preferred) ?? available[0])?.value ?? "";
       setPeople(job.scene);
       setButtons(!!available.length);
@@ -215,7 +235,6 @@ export function initMotionExport(getBodyVariant, viewer) {
       pending = null;
       result = null;
       if (dialog.open) dialog.close("cancel");
-      template.value = "";
       setPeople(null);
       setButtons(false);
       sync();
@@ -223,32 +242,35 @@ export function initMotionExport(getBodyVariant, viewer) {
   };
 }
 
-async function makePmxVmd(viewer, people, filename, signal) {
-  const actors = viewer.getPmxActors(people);
+export async function makeVmd(actors, filename, target, signal) {
   if (!actors.length) throw appError("export.vmd_character_unavailable");
-  const [{ createPmxRetarget }, { encodePmxVmd, packPmxVmdZip }] = await Promise.all([
-    import("./pmx-retarget.js"), import("./pmx-vmd.js"),
+  const [solverModule, { encodePmxVmd, packPmxVmdZip }] = await Promise.all([
+    target ? import("./pmx-retarget.js") : import("./generic-vmd.js"), import("./pmx-vmd.js"),
   ]);
   const stem = (filename || "FlowHMR").replace(/\.[^.]+$/, "").replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").slice(0, 100);
   const files = [];
   for (const actor of actors) {
     signal.throwIfAborted();
     const { asset } = actor;
-    const clone = asset.clone();
+    const motion = actor.motion ?? await api.getCharacterMotion(actor.id, signal);
+    const clone = target ? asset.clone() : null;
+    let solver;
     try {
-      const solver = createPmxRetarget(clone, asset.rest, actor.motion, { poseOffsets: actor.poseOffsets });
+      solver = target ? solverModule.createPmxRetarget(clone, asset.rest, motion, { poseOffsets: actor.poseOffsets })
+        : solverModule.genericVmdRig(motion, actor.poseOffsets);
       const bytes = await encodePmxVmd({
-        solver, rest: asset.rest, modelName: asset.name,
-        frameCount: actor.motion.frames, fps: actor.fps, startFrame: actor.start, sceneEndFrame: actor.sceneEnd,
+        solver, rest: target ? asset.rest : solver.rest, modelName: target ? asset.name : "FlowHMR",
+        frameCount: motion.frames, fps: actor.fps, startFrame: actor.start, sceneEndFrame: actor.sceneEnd,
         placement: { yaw: actor.yaw, offset: actor.offset }, signal,
       });
       const tag = actor.person == null ? "" : `_person${actor.person}`;
-      files.push({ name: `${stem}${tag}_pmx.vmd`, bytes });
+      files.push({ name: `${stem}${tag}_${target ? "pmx" : "vmd"}.vmd`, bytes });
     } finally {
-      asset.releaseClone(clone);
+      if (clone) asset.releaseClone(clone);
+      else solver?.dispose();
     }
   }
   return files.length === 1
     ? { blob: new Blob([files[0].bytes], { type: "application/octet-stream" }), filename: files[0].name }
-    : { blob: packPmxVmdZip(files), filename: `${stem}_pmx_vmd.zip` };
+    : { blob: packPmxVmdZip(files), filename: `${stem}${target ? "_pmx" : ""}_vmd.zip` };
 }

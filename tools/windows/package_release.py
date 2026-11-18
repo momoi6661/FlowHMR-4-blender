@@ -2,7 +2,7 @@
 
 import argparse
 import hashlib
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 import json
 import os
 from pathlib import Path
@@ -14,10 +14,12 @@ import tempfile
 import zipfile
 
 if __package__:
+    from .adapt_sam import adapt_sam
     from .desktop_runtime_build import adapt_winforms, stage_dotnet_runtime
     from .desktop_update import PACKAGE, UPDATE_INFO, VERSION_FILE, read_version, release_version
     from .install_fbx import WHEEL_NAME as FBX_WHEEL_NAME, binding_from_wheel
 else:
+    from adapt_sam import adapt_sam
     from desktop_runtime_build import adapt_winforms, stage_dotnet_runtime
     from desktop_update import PACKAGE, UPDATE_INFO, VERSION_FILE, read_version, release_version
     from install_fbx import WHEEL_NAME as FBX_WHEEL_NAME, binding_from_wheel
@@ -77,6 +79,12 @@ def checksum(path):
 
 
 def copy_runtime(target, prerequisites, *, bundle_cuda=False):
+    try:
+        mcp_version = version("mcp")
+    except PackageNotFoundError:
+        mcp_version = None
+    if mcp_version != "1.28.0":
+        raise RuntimeError("Install the locked Windows requirements before staging the MCP runtime.")
     if (sys.platform != "win32" or sys.version_info[:2] != (3, 10) or struct.calcsize("P") != 8
             or version("torch") != "2.8.0+cu128" or version("torchvision") != "0.23.0+cu128"
             or version("imageio-ffmpeg") != "0.8.1"):
@@ -134,6 +142,9 @@ def copy_runtime(target, prerequisites, *, bundle_cuda=False):
     gpu_info = (f"PyTorch {version('torch')}\nTorchVision {version('torchvision')}\n" if bundle_cuda
                 else "PyTorch and TorchVision are installed on demand from the Runtime Environment page.\n")
     (target / "BUILD-INFO.txt").write_text(f"CPython {sys.version.split()[0]} x64\n" + gpu_info, encoding="ascii")
+    subprocess.run((str(target / "python.exe"), "-I", "-c",
+                    "from mcp.server.fastmcp import FastMCP; import pydantic, pywintypes"),
+                   check=True, creationflags=subprocess.CREATE_NO_WINDOW)
 
 
 def copy_dinov3(destination, source):
@@ -157,26 +168,6 @@ def copy_dinov3(destination, source):
                         .replace(original, replacement), encoding="utf-8")
 
 
-def adapt_sam_windows_paths(destination):
-    # TorchScript's Windows filename overload does not handle Unicode paths.
-    # Use the file-object overload only when needed; it reads the archive into RAM.
-    head = destination / "third_party/sam-3d-body/sam_3d_body/models/heads/mhr_head.py"
-    code = head.read_text(encoding="utf-8")
-    original = ('            self.mhr = torch.jit.load(\n'
-                '                mhr_model_path,\n'
-                '                map_location=("cuda" if torch.cuda.is_available() else "cpu"),\n'
-                '            )')
-    if code.count(original) != 1:
-        raise RuntimeError("The pinned SAM MHR loader changed; review the Windows path adapter.")
-    replacement = ('            device = "cuda" if torch.cuda.is_available() else "cpu"\n'
-                   '            if os.name == "nt" and not os.fspath(mhr_model_path).isascii():\n'
-                   '                with open(mhr_model_path, "rb") as model_file:\n'
-                   '                    self.mhr = torch.jit.load(model_file, map_location=device)\n'
-                   '            else:\n'
-                   '                self.mhr = torch.jit.load(mhr_model_path, map_location=device)')
-    head.write_text(code.replace(original, replacement), encoding="utf-8")
-
-
 def stage_release(destination, prerequisites, dinov3_source, *, bundle_cuda=False, version=None):
     if version is not None:
         release_version(version)
@@ -192,7 +183,7 @@ def stage_release(destination, prerequisites, dinov3_source, *, bundle_cuda=Fals
                    (path for path in git_files("--cached", cwd=source)
                     if not path.as_posix().startswith(SUBMODULE_DEMOS[name])))
     copy_dinov3(destination, dinov3_source)
-    adapt_sam_windows_paths(destination)
+    adapt_sam(destination)
     from flowhmr.hamer_setup import runtime_installed
 
     if not runtime_installed():

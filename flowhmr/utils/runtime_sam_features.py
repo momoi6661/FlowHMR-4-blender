@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 import datetime
 import os
 import os.path as osp
@@ -12,7 +13,11 @@ import torch
 from torch import Tensor
 
 from flowhmr.model_files import missing_model_paths, sam3d_paths
-from flowhmr.runtime_rocm import supports_bf16
+from flowhmr.runtime_rocm import supports_bf16, uses_shared_memory
+
+from .runtime_capabilities import SAMMemoryError
+from .sam_batch import MIB, SAMBatchPlanner, memory_error_resource
+from .sam_feature_only import make_hand_skeleton
 
 # Repo root + local sam_3d_body package path
 _repo_root = osp.normpath(osp.join(osp.dirname(__file__), "..", ".."))
@@ -21,17 +26,6 @@ if _sam_repo_dir not in sys.path:
     sys.path.insert(0, _sam_repo_dir)
 
 from sam_3d_body import SAM3DBodyEstimator, load_sam_3d_body
-
-
-def _gpu_memory_error(error: RuntimeError) -> bool:
-    message = str(error).lower()
-    return isinstance(error, torch.cuda.OutOfMemoryError) or any(
-        phrase in message for phrase in (
-            "cuda out of memory", "cuda error: out of memory", "cuda driver error: out of memory",
-            "hip out of memory", "hip error: out of memory", "hiperroroutofmemory",
-            "cublas_status_alloc_failed", "cudnn_status_alloc_failed",
-        )
-    )
 
 
 # Visualize function (module-level cache)
@@ -50,6 +44,61 @@ def get_visualize_fn():
     return _visualize_fn_cache
 
 
+# Sparse hand conditioning: decode the two hand decoders on one seeded frame per
+# ``hand_stride``-wide interval, then linearly interpolate the hand token slots.
+HAND_SAMPLE_SEED = 20261014
+SAM_HAND_STRIDES = (1, 2, 4)
+
+
+def sample_hand_frames(total: int, stride: int, seed: int) -> np.ndarray:
+    """One seeded random frame per ``stride``-wide interval.
+
+    Rows before the first sample and after the last are held constant by
+    :func:`fill_hand_slots`, so the endpoints never extrapolate.
+    """
+    if total < 1 or stride < 1:
+        raise ValueError("Frame count and hand stride must be positive")
+    rng = np.random.RandomState(seed)
+    return np.array(
+        [int(rng.randint(start, min(start + stride, total))) for start in range(0, total, stride)],
+        dtype=np.int64,
+    )
+
+
+def fill_hand_slots(tokens: Tensor, indices: np.ndarray, *, in_place=False) -> Tensor:
+    """Blend the 2048 hand slots linearly between sampled frames, ends held.
+
+    Rows outside ``indices`` must carry NaN in the hand slots, which is what
+    ``lite_sam_infer.extract_tokens`` leaves behind when only the sampled frames
+    were decoded.
+    """
+    total = tokens.shape[0]
+    idx = torch.as_tensor(np.asarray(indices, dtype=np.int64))
+    if idx.numel() == 0 or int(idx.min()) < 0 or int(idx.max()) >= total:
+        raise ValueError("Hand sample indices must stay inside the token array")
+    hand = tokens[:, 1024:]
+    filled = tokens if in_place else tokens.clone()
+    if not hand.shape[1]:
+        return filled
+    unsampled = torch.ones(total, dtype=torch.bool)
+    unsampled[idx] = False
+    block = max(1, 8 * MIB // (5 * hand.shape[1] * hand.element_size()))
+    for start in range(0, total, block):
+        stop = min(start + block, total)
+        if not bool(torch.isnan(hand[start:stop][unsampled[start:stop]]).all()):
+            raise RuntimeError("Expected unset hand slots to hold NaN before filling")
+        if idx.numel() == 1:
+            filled[start:stop, 1024:] = hand[idx[0]].clone()
+            continue
+        position = torch.arange(start, stop)
+        right = torch.searchsorted(idx, position, right=True).clamp(1, idx.numel() - 1)
+        left = (right - 1).clamp_min(0)
+        span = (idx[right] - idx[left]).clamp_min(1).float()
+        weight = ((position - idx[left]).float() / span).clamp(0.0, 1.0).unsqueeze(-1)
+        filled[start:stop, 1024:] = hand[idx[left]] * (1.0 - weight) + hand[idx[right]] * weight
+    return filled
+
+
 class Sam3DTokenExtractor:
     """Drop-in wrapper that adds ``extract_frame`` to an unmodified SAM3DBodyEstimator.
 
@@ -58,17 +107,36 @@ class Sam3DTokenExtractor:
     """
 
     def __init__(self, estimator, *, frame_batch_size=16,
-                 use_gpu_preprocess=True):
+                 use_gpu_preprocess=True, hand_stride=1, hand_seed=HAND_SAMPLE_SEED,
+                 fast_features=False, cpu_backbone=False, xpu_backbone=None):
         self.estimator = estimator
         self.faces = estimator.faces
         if type(frame_batch_size) is not int or frame_batch_size < 1:
             raise ValueError("frame_batch_size must be a positive integer")
+        if type(hand_stride) is not int or hand_stride not in SAM_HAND_STRIDES:
+            raise ValueError("hand_stride must be one of {1, 2, 4}")
+        if type(hand_seed) is not int:
+            raise ValueError("hand_seed must be an integer")
         self.frame_batch_size = frame_batch_size
         self.use_gpu_preprocess = bool(use_gpu_preprocess)
+        self.hand_stride = hand_stride
+        self.hand_seed = hand_seed
+        self.fast_features = fast_features
+        self.cpu_backbone = cpu_backbone
+        self._xpu_backbone = xpu_backbone
+        self._hand_skeleton = make_hand_skeleton(estimator.model.head_pose_hand) if fast_features else None
         self._capture_tokens = False
         self._body_tokens: List[torch.Tensor] = []
         self._hand_tokens: List[torch.Tensor] = []
         self._hooks = self._install_hooks()
+
+    @property
+    def xpu_backbone_device(self):
+        return self._xpu_backbone.device if self._xpu_backbone is not None else None
+
+    def release_accelerator(self):
+        if self._xpu_backbone is not None:
+            self._xpu_backbone.release_accelerator()
 
     def _install_hooks(self) -> List[torch.utils.hooks.RemovableHandle]:
         model = self.estimator.model
@@ -152,11 +220,14 @@ class Sam3DTokenExtractor:
 
     def extract_frames(self, images, boxes, cameras, *, frame_batch_size=None,
                        use_gpu_preprocess=None, hand_boxes_out=None, hand_boxes_only=False,
-                       merge_hands=True) -> Tensor:
+                       merge_hands=True, hand_indices=None) -> Tensor:
         """Extract body and both hand tokens without full SAM postprocessing.
 
         Defaults use sixteen video frames per batch and GPU crop preprocessing.
         Each chunk runs its body batch followed by both hands in one batch.
+        ``hand_indices`` (positions inside ``images``) limits the two hand
+        decoders to those frames; the other rows get NaN hand slots that
+        :func:`fill_hand_slots` interpolates afterwards.
         ``extract_frame`` continues to return complete SAM visualization data.
         """
         from .lite_sam_infer import extract_tokens
@@ -169,17 +240,27 @@ class Sam3DTokenExtractor:
         if not images:
             return torch.empty((0, 2, 4) if hand_boxes_only else (0, 3072), dtype=torch.float32)
         gpu_preprocess = self.use_gpu_preprocess if use_gpu_preprocess is None else bool(use_gpu_preprocess)
+        if self._xpu_backbone is not None:
+            gpu_preprocess = False
+        if hand_indices is not None:
+            hand_indices = np.asarray(hand_indices, dtype=np.int64)
+            if hand_indices.size and (hand_indices.min() < 0 or hand_indices.max() >= len(images)):
+                raise ValueError("hand_indices must stay inside the images")
         self._body_tokens.clear()
         self._hand_tokens.clear()
         tokens = []
         for start in range(0, len(images), batch_size):
             stop = start + batch_size
+            local = None
+            if hand_indices is not None and not hand_boxes_only:
+                local = hand_indices[(hand_indices >= start) & (hand_indices < stop)] - start
             tokens.append(extract_tokens(
                 self.estimator, images[start:stop], boxes[start:stop], cameras[start:stop],
                 gpu_preprocess=gpu_preprocess, merge_hands=merge_hands,
                 hand_boxes_out=hand_boxes_out, hand_boxes_only=hand_boxes_only,
+                hand_indices=local, fast_features=self.fast_features, hand_skeleton=self._hand_skeleton,
             ))
-        return torch.cat(tokens)
+        return tokens[0] if len(tokens) == 1 else torch.cat(tokens)
 
     def close(self):
         """Remove this wrapper's hooks without changing the underlying model."""
@@ -188,23 +269,23 @@ class Sam3DTokenExtractor:
         self._hooks.clear()
         self._body_tokens.clear()
         self._hand_tokens.clear()
+        self.release_accelerator()
 
     # Helpers
     @staticmethod
     def _get_total_frames(video_path: str) -> int:
         cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise ValueError(f"cannot open video: {video_path}")
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total <= 0:
-            total = 0
-            while True:
-                ok, _ = cap.read()
-                if not ok:
-                    break
-                total += 1
-        cap.release()
-        return total
+        try:
+            if not cap.isOpened():
+                raise ValueError(f"cannot open video: {video_path}")
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total <= 0:
+                total = 0
+                while cap.grab():
+                    total += 1
+            return total
+        finally:
+            cap.release()
 
     @staticmethod
     def _pad_crop(tensor: Tensor, target_len: int) -> Tensor:
@@ -245,7 +326,9 @@ class Sam3DTokenExtractor:
         progress_cb: Optional[Callable[[str, int, Optional[int], str], None]] = None,
         frame_batch_size: Optional[int] = None,
         use_gpu_preprocess: Optional[bool] = None,
-        on_oom_reduce: Optional[Callable[[int], None]] = None,
+        sam_hand_stride: Optional[int] = None,
+        adaptive_batch: bool = False,
+        batch_cb: Optional[Callable[[dict], None]] = None,
         hand_boxes_out: Optional[list] = None,
         _hand_boxes_only: bool = False,
     ) -> Tensor:
@@ -256,10 +339,13 @@ class Sam3DTokenExtractor:
         batch_size = self.frame_batch_size if frame_batch_size is None else frame_batch_size
         if type(batch_size) is not int or batch_size < 1:
             raise ValueError("frame_batch_size must be a positive integer")
+        hand_stride = self.hand_stride if sam_hand_stride is None else sam_hand_stride
+        if type(hand_stride) is not int or hand_stride not in SAM_HAND_STRIDES:
+            raise ValueError("sam_hand_stride must be 1, 2 or 4")
+        if hand_stride > 1 and use_mask:
+            raise ValueError("sam_hand_stride > 1 is not supported together with use_mask")
 
         device = torch.device(self.estimator.device)
-        retry_in_gpu_memory = on_oom_reduce is not None and device.type == "cuda"
-        low_memory = False
         total_frames = self._get_total_frames(video_path)
 
         bbox_xyxy = bbox_xyxy.detach().cpu().to(torch.float32)
@@ -267,85 +353,141 @@ class Sam3DTokenExtractor:
         bbox_xyxy = self._pad_crop(bbox_xyxy, total_frames)
         K_all = self._pad_crop(K_all, total_frames)
 
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise ValueError(f"cannot open video: {video_path}")
-
         end = min(total_frames, max_frames) if max_frames is not None and max_frames > 0 else total_frames
+        if not 0 <= start_frame < end:
+            raise ValueError(f"Invalid SAM frame range: [{start_frame},{end})")
         pbar_total = end - start_frame
-        feats: List[Tensor] = []
+        output = None
+        planner = None
+        done = 0
         t_start = time.time()
+        from .runtime_video_processing import open_video_at_frame
+
+        cap = open_video_at_frame(video_path, start_frame, lambda: _call_progress(
+            progress_cb, "sam", 0, pbar_total, "sam: start"))
         try:
-            if not 0 <= start_frame < end:
-                raise ValueError(f"Invalid SAM frame range: [{start_frame},{end})")
+            sampled_frames = (None if hand_stride == 1 or _hand_boxes_only else
+                              sample_hand_frames(pbar_total, hand_stride, self.hand_seed) + start_frame)
+            if adaptive_batch:
+                width = max(1, int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)))
+                height = max(1, int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+                if self.xpu_backbone_device is not None:
+                    planner = SAMBatchPlanner(self.xpu_backbone_device, width * height * 3, host_processing=True)
+                else:
+                    planner = SAMBatchPlanner(device, width * height * 3)
+
+            def hand_samples(first, count):
+                if sampled_frames is None:
+                    return None
+                left, right = sampled_frames.searchsorted([first, first + count])
+                return sampled_frames[left:right] - first
+
             _call_progress(progress_cb, "sam", 0, pbar_total, "sam: start")
-            if start_frame and not cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame):
-                for _ in range(start_frame):
-                    if not cap.grab():
-                        raise ValueError(f"Cannot reach video frame {start_frame + 1}")
-            i = start_frame
-            while i < end:
-                frames = []
-                for _ in range(min(batch_size, end - i)):
-                    ok, frame_bgr = cap.read()
-                    if not ok:
-                        break
-                    frames.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-                if not frames:
+            frames = []
+            eof = False
+            last_logged = 0
+            can_split_hands = not (use_mask or _hand_boxes_only)
+            row_bytes = 4 * (8 if _hand_boxes_only else 3072) + (32 if hand_boxes_out is not None else 0)
+            while done < pbar_total:
+                first = start_frame + done
+                remaining = len(frames) if eof else pbar_total - done
+                if not remaining:
                     break
-                offset = 0
-                while offset < len(frames):
-                    count = min(batch_size, len(frames) - offset)
-                    first, stop = i + offset, i + offset + count
-                    chunk = frames[offset:offset + count]
-                    failed = False
-                    hand_boxes = [] if hand_boxes_out is not None else None
+
+                def hand_crops(count):
+                    samples = hand_samples(first, count)
+                    hands = 0 if _hand_boxes_only else count if samples is None else len(samples)
+                    return hands if planner.low_memory else 2 * hands
+
+                count = min(batch_size, remaining)
+                if planner is not None:
+                    before = planner.before_batch()
+                    pending_output = (pbar_total - done) * row_bytes
+                    if sampled_frames is not None:
+                        pending_output += 8 * MIB  # Bounded interpolation workspace.
                     try:
-                        if use_mask:
-                            tokens = torch.stack([
-                                self.extract_frame(
-                                    frame, bboxes=bbox_xyxy[index].reshape(1, 4).numpy(),
-                                    cam_int=K_all[index].reshape(1, 3, 3), use_mask=True,
-                                    bbox_thr=bbox_thr, nms_thr=nms_thr,
-                                )[0].to(torch.float32)
-                                for index, frame in enumerate(chunk, first)
-                            ])
-                        else:
-                            tokens = self.extract_frames(
-                                chunk, bbox_xyxy[first:stop], K_all[first:stop],
-                                frame_batch_size=count,
-                                use_gpu_preprocess=False if low_memory else use_gpu_preprocess,
-                                hand_boxes_out=hand_boxes, hand_boxes_only=_hand_boxes_only,
-                                merge_hands=not low_memory,
-                            )
-                    except RuntimeError as error:
-                        if not retry_in_gpu_memory or not _gpu_memory_error(error):
+                        count = planner.choose(before, remaining, pending_output, hand_crops)
+                    except SAMMemoryError as error:
+                        can_save_memory = error.resource == "vram" or planner.shared_gpu
+                        if not can_save_memory or planner.low_memory or not can_split_hands:
                             raise
-                        if count == 1 and (low_memory or use_mask):
-                            raise
-                        failed = True
-                    if failed:
-                        # Leave the exception scope first so its CUDA tensors can be released.
-                        self._body_tokens.clear()
-                        self._hand_tokens.clear()
-                        with torch.cuda.device(device):
-                            torch.cuda.empty_cache()
-                        if count == 1:
-                            low_memory = True
-                            batch_size = 1
-                            print("  [sam] minimum-memory retry: CPU crops and separate hand passes", flush=True)
-                        else:
-                            batch_size = count // 2
-                        on_oom_reduce(batch_size)
-                        continue
-                    feats.extend((tokens if _hand_boxes_only else tokens[:, :token_dim]).unbind(0))
-                    if hand_boxes is not None:
-                        hand_boxes_out.extend(hand_boxes)
-                    offset += count
-                    _call_progress(progress_cb, "sam", stop - start_frame, pbar_total, "sam: running")
-                i += len(frames)
-                done = i - start_frame
-                if done % 10 == 0 or done == pbar_total:
+                        planner.split_hands()
+                        count = planner.choose(before, remaining, pending_output, hand_crops)
+                    planner.begin()
+                    if batch_cb is not None and planner.info["actual"] is None:
+                        planner.record(count, before, succeeded=False)
+                        batch_cb(planner.info.copy())
+                try:
+                    while len(frames) < count:
+                        ok, frame_bgr = cap.read()
+                        if not ok:
+                            eof = True
+                            break
+                        frames.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+                        del frame_bgr
+                except (MemoryError, OSError, cv2.error) as error:
+                    if planner is not None and memory_error_resource(error) == "ram":
+                        raise SAMMemoryError("ram") from error
+                    raise
+                count = min(count, len(frames))
+                if not count:
+                    break
+                if planner is not None:
+                    planner.frame_bytes = max(planner.frame_bytes, frames[0].nbytes)
+
+                stop = first + count
+                hand_boxes = [] if hand_boxes_out is not None else None
+                low_memory = planner is not None and planner.low_memory
+                failure = None
+                try:
+                    if use_mask:
+                        tokens = torch.stack([
+                            self.extract_frame(
+                                frame, bboxes=bbox_xyxy[index].reshape(1, 4).numpy(),
+                                cam_int=K_all[index].reshape(1, 3, 3), use_mask=True,
+                                bbox_thr=bbox_thr, nms_thr=nms_thr,
+                            )[0].to(torch.float32)
+                            for index, frame in enumerate(frames[:count], first)
+                        ])
+                    else:
+                        tokens = self.extract_frames(
+                            frames[:count], bbox_xyxy[first:stop], K_all[first:stop],
+                            frame_batch_size=count,
+                            use_gpu_preprocess=False if low_memory else use_gpu_preprocess,
+                            hand_boxes_out=hand_boxes, hand_boxes_only=_hand_boxes_only,
+                            merge_hands=not low_memory,
+                            hand_indices=hand_samples(first, count),
+                        )
+                    tokens = tokens if _hand_boxes_only else tokens[:, :token_dim]
+                    if output is None:
+                        output = tokens.new_empty((pbar_total, *tokens.shape[1:]))
+                    output[done:done + count].copy_(tokens)
+                    del tokens
+                except (MemoryError, OSError, RuntimeError, cv2.error) as error:
+                    failure = memory_error_resource(error) if planner is not None else None
+                    if failure is None:
+                        raise
+                    if count == 1 and (failure == "ram" or low_memory or not can_split_hands):
+                        raise SAMMemoryError(failure) from error
+                if failure:
+                    # Retry the same decoded frames after the failed tensors have unwound.
+                    self._body_tokens.clear()
+                    self._hand_tokens.clear()
+                    planner.retry(count, failure)
+                    continue
+                if planner is not None:
+                    after = planner.snapshot()
+                    planner.observe(before, after, count, hand_crops(count))
+                    planner.record(count, after, succeeded=True)
+                    if batch_cb is not None:
+                        batch_cb(planner.info.copy())
+                if hand_boxes is not None:
+                    hand_boxes_out.extend(hand_boxes)
+                del frames[:count]
+                done += count
+                _call_progress(progress_cb, "sam", done, pbar_total, "sam: running")
+                if done - last_logged >= 10 or done == pbar_total:
+                    last_logged = done
                     elapsed = time.time() - t_start
                     fps = done / elapsed if elapsed > 0 else 0
                     eta = (pbar_total - done) / fps if fps > 0 else 0
@@ -357,11 +499,23 @@ class Sam3DTokenExtractor:
                     )
         finally:
             cap.release()
-            _call_progress(progress_cb, "sam", len(feats), pbar_total, "sam: done")
+            if planner is not None:
+                planner.close()
 
-        if len(feats) == 0:
+        if done == 0:
             raise ValueError(f"no frames extracted from video: {video_path}")
-        return torch.stack(feats, dim=0)
+        stacked = output[:done]
+        if sampled_frames is not None:
+            keep = (sampled_frames - start_frame)[(sampled_frames - start_frame) < stacked.shape[0]]
+            if keep.size == 0:
+                raise ValueError("sparse hand sampling kept no frames")
+            fill_hand_slots(stacked, keep, in_place=True)
+            print(
+                f"    [sam] sparse hands: decoded {keep.size}/{stacked.shape[0]} frames "
+                f"(stride {hand_stride}), rest linearly interpolated"
+            )
+        _call_progress(progress_cb, "sam", done, pbar_total, "sam: done")
+        return stacked
 
     def extract_video_hand_boxes(self, video_path, **kwargs) -> np.ndarray:
         """Recover original-frame left/right boxes without recomputing hand tokens."""
@@ -378,7 +532,7 @@ class Sam3DTokenExtractor:
         batch = {key: value.to(device) for key, value in batch.items() if isinstance(value, Tensor)}
         model = self.estimator.model
         try:
-            with torch.cuda.device(device):
+            with torch.cuda.device(device) if device.type == "cuda" else nullcontext():
                 model._initialize_batch(batch)
                 output = model.forward_step(batch, decoder_type="body")["mhr"]
                 return (output["pred_keypoints_3d"][:, joint_ids]
@@ -498,28 +652,42 @@ def _call_progress(
         progress_cb(stage, current, total, message)
 
 
-def _maybe_convert_backbone_to_fp16(sam_model, device: torch.device) -> None:
+def _select_backbone_precision(sam_model, device: torch.device) -> None:
     if sam_model.backbone_dtype != torch.bfloat16:
         return
-    gpu_supports_bf16_tc = supports_bf16(torch, device)
-    if gpu_supports_bf16_tc:
-        return
+    if device.type == "cpu":
+        from .sam_cpu_backbone import cpu_backbone_supported
 
-    print(f" [sam3d] GPU {torch.cuda.get_device_name(device)} has no BF16 Tensor Cores, "
-          f"converting backbone to FP16")
-    for p in sam_model.backbone.parameters():
-        if p.dtype == torch.bfloat16:
-            p.data = p.data.to(torch.float16)
-    for buf in sam_model.backbone.buffers():
-        if buf.dtype == torch.bfloat16:
-            buf.data = buf.data.to(torch.float16)
-    sam_model.backbone_dtype = torch.float16
+        if cpu_backbone_supported():
+            print(" [sam3d] CPU: using BF16 for the SAM backbone")
+            return
+        dtype = torch.float32
+    else:
+        if supports_bf16(torch, device):
+            return
+        dtype = torch.float16
+    print(f" [sam3d] {device}: using {dtype} for the SAM backbone")
+    for tensor in (*sam_model.backbone.parameters(), *sam_model.backbone.buffers()):
+        if tensor.dtype == torch.bfloat16:
+            tensor.data = tensor.data.to(dtype)
+    sam_model.backbone_dtype = dtype
 
 
 def build_sam3d_extractor(device: torch.device, *, frame_batch_size=16,
-                          use_gpu_preprocess=True, use_compile=None, load_device=None) -> Sam3DTokenExtractor:
+                          use_gpu_preprocess=True, use_compile=None, load_device=None,
+                          hand_stride=1, hand_seed=HAND_SAMPLE_SEED, cpu_backbone=False,
+                          xpu_backbone_device=None) -> Sam3DTokenExtractor:
     from .sam_compile import enable_sam_compile, resolve_sam_compile
 
+    device = torch.device(device)
+    if xpu_backbone_device is not None:
+        xpu_backbone_device = torch.device(xpu_backbone_device)
+        if (xpu_backbone_device.type != "xpu" or device.type != "cpu" or cpu_backbone
+                or (load_device is not None and torch.device(load_device).type != "cpu")):
+            raise ValueError("Intel SAM uses an XPU encoder with CPU pose decoders")
+        if use_compile:
+            raise ValueError("SAM compilation is unavailable for the Intel runtime")
+        use_compile = False
     compile_backbone = resolve_sam_compile(device, use_compile)
     paths = sam3d_paths()
     missing = missing_model_paths(paths)
@@ -532,12 +700,29 @@ def build_sam3d_extractor(device: torch.device, *, frame_batch_size=16,
         mhr_path=str(mhr),
         device=load_device if load_device is not None else device,
     )
-    _maybe_convert_backbone_to_fp16(sam_model, device)
+    xpu_backbone = None
+    if xpu_backbone_device is not None:
+        from .sam_xpu_backbone import XPUSAMBackbone
+
+        xpu_backbone = XPUSAMBackbone(sam_model.backbone, xpu_backbone_device, sam_model.backbone_dtype)
+        sam_model.backbone = xpu_backbone
+        # Leave CPU crop inputs in FP32 until the encoder converts them once.
+        sam_model.backbone_dtype = torch.float32
+    else:
+        _select_backbone_precision(sam_model, device)
+    if cpu_backbone:
+        from .sam_cpu_backbone import CPUSAMBackbone
+
+        sam_model.backbone = CPUSAMBackbone(sam_model.backbone)
+        print(f" [sam3d] Hybrid mode: CPU BF16 backbone ({sam_model.backbone.threads} threads), HIP decoders", flush=True)
     if compile_backbone:
         enable_sam_compile(sam_model, device)
     estimator = SAM3DBodyEstimator(sam_3d_body_model=sam_model, model_cfg=sam_cfg)
     return Sam3DTokenExtractor(estimator, frame_batch_size=frame_batch_size,
-                               use_gpu_preprocess=use_gpu_preprocess)
+                               use_gpu_preprocess=use_gpu_preprocess and device.type == "cuda",
+                               hand_stride=hand_stride, hand_seed=hand_seed,
+                               fast_features=device.type == "cpu" or uses_shared_memory(torch, device),
+                               cpu_backbone=cpu_backbone, xpu_backbone=xpu_backbone)
 
 
 if __name__ == "__main__":

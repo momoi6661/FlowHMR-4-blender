@@ -16,6 +16,9 @@ models/
 ├── flowhmr_latest/
 │   ├── flowhmr_latest.ckpt
 │   └── config.yml
+├── flowhmr_base/                 ← 可选的躯干动作优化检查点
+│   ├── flowhmr_base.ckpt
+│   └── config.yml
 ├── yolox/
 │   └── yolox_l.pth
 ├── sam-3d-body-dinov3/
@@ -35,6 +38,12 @@ models/
 ```
 
 `download-models.cmd` 下载公共文件。其中 [SAM 3D Body DINOv3](https://www.modelscope.cn/models/facebook/sam-3d-body-dinov3) 和 [VGGT-Omega](https://www.modelscope.cn/models/facebook/VGGT-Omega) 从魔搭下载并校验 SHA-256，无需 Hugging Face 授权。两者都须安装；固定机位跳过 VGGT 推理。
+
+### 躯干动作优化（可选模型）
+
+生成设置里的 **躯干动作优化** 需要可选的 **FlowHMR 躯干模型（base）**：在 **模型** 面板找到同名一行，点 **下载**（约 1.72 GB，来自与主模型相同的官方 Hugging Face 仓库并核对 SHA-256）。安装后开关变为可用，未安装时开关会禁用并提示。
+
+开启后，程序会再用 base 检查点多生成一次，只取骨盆、脊柱、颈头和头部的动作，并把标准结果的脚部世界位置和朝向还原回去，因此生成时间会略微增加。手指和其他关节仍来自当前的主模型；需要可选模型时也可把 `flowhmr_base` 文件夹放入 `models/` 后点 **刷新**。
 
 ### HaMeR 手指精修
 

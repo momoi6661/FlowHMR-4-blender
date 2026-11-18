@@ -34,7 +34,23 @@ const postJson = (path, body) => json(path, {
   body: JSON.stringify(body || {}),
 });
 
+// Old running backends omitted provenance from job responses. Completed results
+// can still supply explicit source metadata without unloading their AI models.
+const sourceMetadata = new Map();
+async function withSourceMetadata(job) {
+  if (["image", "video"].includes(job.source_kind) || job.status !== "done") return job;
+  if (!sourceMetadata.has(job.id)) {
+    sourceMetadata.set(job.id, json(`/api/jobs/${job.id}/meta`, { cache: "no-store" }).then(meta =>
+      ["image", "video"].includes(meta.source_kind) ? {
+        source_kind: meta.source_kind, ...(meta.source_name ? { source_name: meta.source_name } : {}),
+      } : {}).catch(() => ({})));
+  }
+  return { ...job, ...await sourceMetadata.get(job.id) };
+}
+
 export const getInfo = () => json("/api/info", { cache: "no-store" });
+export const getGpu = () => json("/api/gpu", { cache: "no-store" });
+export const releaseGpu = () => postJson("/api/gpu/release");
 export const getModelDownload = () => json("/api/models/download", { cache: "no-store" });
 export const startModelDownload = (group) => postJson("/api/models/download", group ? { group } : {});
 export const stopModelDownload = (id) => postJson("/api/models/download/stop", { id });
@@ -45,18 +61,24 @@ export const getRuntime = () => json("/api/runtime", { cache: "no-store" });
 export const startRuntimeDownload = (version) => postJson("/api/runtime/download", { version });
 export const stopRuntimeDownload = (id) => postJson("/api/runtime/download/stop", { id });
 export const selectRuntime = (version) => postJson("/api/runtime/select", { version });
-export function getJobs({ before, through } = {}) {
+export async function getJobs({ before, through } = {}) {
   const query = new URLSearchParams({ limit: "20" });
   if (before) query.set("before", before);
   if (through) query.set("through", through);
-  return json(`/api/jobs?${query}`, { cache: "no-store" });
+  const page = await json(`/api/jobs?${query}`, { cache: "no-store" });
+  return { ...page, jobs: await Promise.all(page.jobs.map(withSourceMetadata)) };
 }
 export const deleteJobs = (ids) => json("/api/jobs", {
   method: "DELETE",
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify(ids ? { ids } : {}),
 });
-export const getJob = (id) => json(`/api/jobs/${id}`);
+export const getJob = (id) => json(`/api/jobs/${id}`).then(withSourceMetadata);
+export const getPosePresets = () => json("/api/pose-presets", { cache: "no-store" });
+export const savePosePreset = (value) => postJson("/api/pose-presets", value);
+export const getPosePreset = (id) => json(`/api/pose-presets/${encodeURIComponent(id)}`);
+export const deletePosePreset = (id) => json(`/api/pose-presets/${encodeURIComponent(id)}`, { method: "DELETE" });
+export const applyPosePreset = (id, value) => postJson(`/api/jobs/${encodeURIComponent(id)}/pose-presets`, value);
 export const getMeta = (id, signal) => json(`/api/jobs/${id}/meta`, { signal });
 export const getVertices = (id, signal, body = "neutral") => request(`/api/jobs/${id}/vertices?body=${encodeURIComponent(body)}`, { signal }).then((r) => r.arrayBuffer());
 export const getFaces = (id, signal) => request(`/api/jobs/${id}/faces`, { signal }).then((r) => r.arrayBuffer());
@@ -97,17 +119,39 @@ const characterActorsQuery = (actors) => new URLSearchParams(actors.map((actor) 
 export const getCharacterLibrary = (actors, signal) => json(`/api/character-library?${characterActorsQuery(actors)}`,
   { signal, cache: "no-store" });
 export const saveLibraryCharacter = (ticket, name) => postJson("/api/character-library", { ticket, name });
+export const lookupLibraryCharacter = (ticket, signal) => json("/api/character-library/lookup", {
+  method:"POST", headers:{ "Content-Type":"application/json" }, body:JSON.stringify({ticket}), signal,
+});
+export const characterThumbnailUrl = (id) => `/api/character-library/${encodeURIComponent(id)}/thumbnail`;
+export const saveCharacterThumbnail = (id, png) => json(characterThumbnailUrl(id), {
+  method: "POST", headers: { "Content-Type": "image/png" }, body: png,
+});
 export const openLibraryCharacter = (id, signal) => json(`/api/character-library/${encodeURIComponent(id)}/open`,
   { method: "POST", signal });
 export const deleteLibraryCharacter = (id, actors) => json(
   `/api/character-library/${encodeURIComponent(id)}?${characterActorsQuery(actors)}`, { method: "DELETE" });
-export const saveActorCharacter = (actor, id, offsets, select) => json(
+export const saveActorCharacter = (actor, id, offsets, select, retargetPreset) => json(
   `/api/character-library/actors/${encodeURIComponent(actor.id)}`, {
     method: "PUT", headers: { "Content-Type": "application/json" }, keepalive: !select,
-    body: JSON.stringify({ id, offsets, select, person: actor.number ?? null }),
+    body: JSON.stringify({ id, offsets, select, person: actor.number ?? null,
+      retarget_preset: retargetPreset, remember: select }),
   });
-export const selectPeople = (id, people) => postJson(`/api/jobs/${id}/select`,
-  people.length === 1 ? { people, person: people[0] } : { people });
+export const saveRetargetPreset = (preset) => json("/api/character-library/retarget-presets", {
+  method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(preset),
+});
+const retargetPresetsUrl = "/api/character-library/retarget-presets";
+const builtinRetargetPresetUrl = (profile) => `${retargetPresetsUrl}/builtin/${encodeURIComponent(profile)}`;
+export const deleteRetargetPreset = (id) => json(`${retargetPresetsUrl}/${encodeURIComponent(id)}`, { method:"DELETE" });
+export const saveBuiltinRetargetPreset = (profile, preset) => json(builtinRetargetPresetUrl(profile), {
+  method:"PUT", headers:{ "Content-Type":"application/json" }, body:JSON.stringify(preset),
+});
+export const resetBuiltinRetargetPreset = (profile) => json(builtinRetargetPresetUrl(profile), { method:"DELETE" });
+export const retargetPresetThumbnailUrl = (id) => `${retargetPresetsUrl}/${encodeURIComponent(id)}/thumbnail`;
+export const saveRetargetPresetThumbnail = (id, png) => json(retargetPresetThumbnailUrl(id), {
+  method:"POST", headers:{ "Content-Type":"image/png" }, body:png,
+});
+export const selectPeople = (id, people, boxEdits = []) => postJson(`/api/jobs/${id}/${boxEdits.length ? "select-boxes" : "select"}`,
+  { people, ...(people.length === 1 ? { person: people[0] } : {}), ...(boxEdits.length ? { box_edits: boxEdits } : {}) });
 export const rerunJob = (id, params) => postJson(`/api/jobs/${id}/rerun`, params).then((res) => res.job_id);
 export const cancelJob = (id) => postJson(`/api/jobs/${id}/cancel`);
 export const prepareScene = (id) => postJson(`/api/jobs/${id}/scene`);
@@ -125,10 +169,18 @@ export const motionUrl = (id, format, people = []) => {
   for (const person of people) query.append("person", String(person));
   return `/api/jobs/${id}/${format}${people.length ? `?${query}` : ""}`;
 };
-export async function exportTemplateFbx(id, people, profile, template, signal) {
+export async function exportTargetFbx(id, people, profile, actor, { paths, samples }, withSkin, signal) {
   const body = new FormData();
-  body.append("template", template);
-  const response = await request(fbxUrl(id, false, "source", people, "none", profile), { method: "POST", body, signal });
+  if (actor.libraryId) body.append("character", actor.libraryId);
+  else {
+    if (!actor.asset.sourceFile) throw appError("retarget.export_failed");
+    body.append("character_file", actor.asset.sourceFile);
+  }
+  body.append("tracks", new Blob([JSON.stringify(paths)], { type:"application/json" }));
+  body.append("samples", new Blob([samples], { type:"application/octet-stream" }));
+  const query = new URLSearchParams({ profile, mesh:withSkin ? "1" : "0" });
+  for (const person of people) query.append("person", String(person));
+  const response = await request(`/api/jobs/${id}/target-fbx?${query}`, { method: "POST", body, signal });
   const header = response.headers.get("Content-Disposition") ?? "";
   const encoded = /filename\*=UTF-8''([^;]+)/i.exec(header)?.[1];
   let filename = /filename="([^"]+)"|filename=([^;]+)/i.exec(header)?.slice(1).find(Boolean) ?? `${profile}.fbx`;
